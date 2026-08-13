@@ -70,7 +70,7 @@ local pendingJob = nil
 -- TRANSLATIONS  (portado 1:1 do original)
 ----------------------------------------------------------------
 
-local CurrentLanguage = "PT"
+local CurrentLanguage = "EN"
 local Translations = {
     PT = {
         Title = "UTMM Kit Scanner", Subtitle = "Farm Guider & Item Finder",
@@ -274,7 +274,7 @@ local INPUT_IDS = {
 
 -- Preferencias usadas pela UI Drawing e pela logica funcional.
 local WIDGET_DEFAULTS = {
-    utmm_lang        = 0,
+    utmm_lang        = 1,
     utmm_level       = "0",
     utmm_resets      = "0",
     utmm_tr          = "0",
@@ -4486,10 +4486,10 @@ function Gui:Button(id, label, x, y, w, h, callback, accent, z)
     self:Box(x, y, w, h, fill, true, z or 3, 6)
     self:Box(x, y, w, h, accent and Theme.accent or Theme.border, false, (z or 3) + 1, 6)
 
-    -- Matcha posiciona o texto um pouco acima do centro visual.
-    -- Este offset deixa labels curtas e longas alinhadas no mesmo eixo.
-    local textY = y + math.floor((h - 12) * 0.5) + 3
-    self:Text(label, x + w * 0.5, textY, Theme.text, 12, true, true, (z or 3) + 2)
+    -- Drawing.Text usa Position como canto superior; centralizamos pela altura visual.
+    local fontSize = 12
+    local textY = y + math.floor((h - fontSize) * 0.5) - 1
+    self:Text(label, x + w * 0.5, textY, Theme.text, fontSize, true, true, (z or 3) + 2)
     self:Register(id, x, y, w, h, callback, (z or 3) + 2)
 end
 
@@ -4859,10 +4859,7 @@ function Gui:DrawHeader(wx, wy, ww)
     self:Line(hx, wy + self.window.header, wx + ww, wy + self.window.header, Theme.borderSoft, 1, 3)
     self:Text(self:PageName(self.selectedPage), hx + 18, wy + 14, Theme.text, 14, false, true, 5)
 
-    local status = self.pageBusy[self.selectedPage] and Lang.Searching or "Matcha LuaVM"
-    self:Text(status, wx + ww - 104, wy + 15,
-        self.pageBusy[self.selectedPage] and Theme.warning or Theme.textMuted, 10, true, false, 5)
-
+    -- O status da tarefa ja aparece junto dos resultados. Nao duplica no header.
     local minX = wx + ww - 62
     local closeX = wx + ww - 32
 
@@ -5362,13 +5359,16 @@ function Gui:RenderMinimized()
     self:Box(wx, wy, ww, wh, Theme.border, false, 2, 10)
     self:Box(wx, wy + wh - 2, ww, 2, Theme.accentSoft, true, 3, 1)
 
-    self:Box(wx + 8, wy + 7, 32, 32, Theme.panel, true, 3, 7)
-    if not self:DrawLogoImage(wx + 10, wy + 9, 28, 28, 6) then
-        self:DrawFallbackLogo(wx + 11, wy + 10, 26)
+    local logoBox = 30
+    local logoX = wx + 10
+    local logoY = wy + math.floor((wh - logoBox) * 0.5)
+    self:Box(logoX, logoY, logoBox, logoBox, Theme.panel, true, 3, 7)
+    if not self:DrawLogoImage(logoX + 1, logoY + 1, logoBox - 2, logoBox - 2, 6) then
+        self:DrawFallbackLogo(logoX + 2, logoY + 2, logoBox - 4)
     end
 
-    self:Text("UTMM GUIDER", wx + 50, wy + 10, Theme.text, 13, false, true, 6)
-    self:Text(self:PageName(self.selectedPage), wx + 50, wy + 27, Theme.textDim, 9, false, false, 6)
+    self:Text("UTMM GUIDER", wx + 50, wy + 9, Theme.text, 13, false, true, 6)
+    self:Text(self:PageName(self.selectedPage), wx + 50, wy + 26, Theme.textDim, 9, false, false, 6)
 
     local restoreX = wx + ww - 62
     local closeX = wx + ww - 32
