@@ -4498,8 +4498,9 @@ function Gui:Button(id, label, x, y, w, h, callback, accent, z)
             end
         end)
 
-        -- +1 e um ajuste optico para a fonte SystemBold do Drawing.
-        local textY = y + math.floor((h - textHeight) * 0.5) + 1
+        -- Drawing/Matcha posiciona a fonte SystemBold pela baseline, não pelo topo.
+        -- +11 compensa a diferença observada e centraliza visualmente os glifos.
+        local textY = y + math.floor((h - textHeight) * 0.5) + 11
         safeSet(textObj, "Position", Vector2.new(math.floor(x + w * 0.5), math.floor(textY)))
     end
 
