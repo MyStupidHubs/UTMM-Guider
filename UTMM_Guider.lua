@@ -4486,10 +4486,23 @@ function Gui:Button(id, label, x, y, w, h, callback, accent, z)
     self:Box(x, y, w, h, fill, true, z or 3, 6)
     self:Box(x, y, w, h, accent and Theme.accent or Theme.border, false, (z or 3) + 1, 6)
 
-    -- Drawing.Text usa Position como canto superior; centralizamos pela altura visual.
+    -- Centraliza pelo TextBounds real quando disponivel.
     local fontSize = 12
-    local textY = y + math.floor((h - fontSize) * 0.5) - 1
-    self:Text(label, x + w * 0.5, textY, Theme.text, fontSize, true, true, (z or 3) + 2)
+    local textObj = self:Text(label, x + w * 0.5, y, Theme.text, fontSize, true, true, (z or 3) + 2)
+    if textObj then
+        local textHeight = fontSize
+        pcall(function()
+            local bounds = textObj.TextBounds
+            if bounds and type(bounds.Y) == "number" and bounds.Y > 0 then
+                textHeight = bounds.Y
+            end
+        end)
+
+        -- +1 e um ajuste optico para a fonte SystemBold do Drawing.
+        local textY = y + math.floor((h - textHeight) * 0.5) + 1
+        safeSet(textObj, "Position", Vector2.new(math.floor(x + w * 0.5), math.floor(textY)))
+    end
+
     self:Register(id, x, y, w, h, callback, (z or 3) + 2)
 end
 
@@ -4863,9 +4876,10 @@ function Gui:DrawHeader(wx, wy, ww)
     local minX = wx + ww - 62
     local closeX = wx + ww - 32
 
-    self:DrawIcon("minimize", minX + 5, wy + 11,
+    local headerCenterY = wy + (self.window.header * 0.5)
+    self:DrawIcon("minimize", minX + 5, math.floor(headerCenterY - 13),
         self.hovered == "minimize" and Theme.text or Theme.textDim, 7)
-    self:Register("minimize", minX, wy + 7, 25, 27, function()
+    self:Register("minimize", minX, wy, 25, self.window.header, function()
         self:BlurInput(true)
         self.overlay = nil
         self.minimized = true
@@ -4877,9 +4891,9 @@ function Gui:DrawHeader(wx, wy, ww)
         self.dirty = true
     end, 20)
 
-    self:DrawIcon("close", closeX + 7, wy + 12,
+    self:DrawIcon("close", closeX + 4, math.floor(headerCenterY - 9),
         self.hovered == "close" and Theme.danger or Theme.textDim, 7)
-    self:Register("close", closeX, wy + 7, 25, 27, function() self:Shutdown() end, 20)
+    self:Register("close", closeX, wy, 25, self.window.header, function() self:Shutdown() end, 20)
 
     self:Register("window_drag", hx, wy, ww - sw - 78, self.window.header, function()
         self.draggingWindow = true
@@ -5354,35 +5368,38 @@ function Gui:RenderMinimized()
 
     local wx, wy = self.window.x, self.window.y
     local ww, wh = self.minimizedWidth, self.minimizedHeight
+    local centerY = wy + (wh * 0.5)
 
     self:Box(wx, wy, ww, wh, Theme.shell, true, 1, 10)
     self:Box(wx, wy, ww, wh, Theme.border, false, 2, 10)
     self:Box(wx, wy + wh - 2, ww, 2, Theme.accentSoft, true, 3, 1)
 
-    local logoBox = 30
+    -- Logo sem moldura extra: fica geometricamente centralizado na barra.
+    local logoSize = 30
     local logoX = wx + 10
-    local logoY = wy + math.floor((wh - logoBox) * 0.5)
-    self:Box(logoX, logoY, logoBox, logoBox, Theme.panel, true, 3, 7)
-    if not self:DrawLogoImage(logoX + 1, logoY + 1, logoBox - 2, logoBox - 2, 6) then
-        self:DrawFallbackLogo(logoX + 2, logoY + 2, logoBox - 4)
+    local logoY = math.floor(centerY - (logoSize * 0.5))
+    if not self:DrawLogoImage(logoX, logoY, logoSize, logoSize, 6) then
+        self:DrawFallbackLogo(logoX + 1, logoY + 1, logoSize - 2)
     end
 
-    self:Text("UTMM GUIDER", wx + 50, wy + 9, Theme.text, 13, false, true, 6)
-    self:Text(self:PageName(self.selectedPage), wx + 50, wy + 26, Theme.textDim, 9, false, false, 6)
+    self:Text("UTMM GUIDER", wx + 50, math.floor(centerY - 10), Theme.text, 13, false, true, 6)
+    self:Text(self:PageName(self.selectedPage), wx + 50, math.floor(centerY + 7), Theme.textDim, 9, false, false, 6)
 
     local restoreX = wx + ww - 62
     local closeX = wx + ww - 32
+    local controlY = math.floor(centerY - 9)
 
-    self:DrawIcon("restore", restoreX + 4, wy + 10,
+    -- DrawIcon usa uma caixa conceitual de 18x18; ambos ficam no mesmo centro.
+    self:DrawIcon("restore", restoreX + 4, controlY,
         self.hovered == "restore" and Theme.accent or Theme.textDim, 7)
-    self:Register("restore", restoreX, wy + 7, 25, 30, function()
+    self:Register("restore", restoreX, wy, 25, wh - 2, function()
         self.minimized = false
         self.dirty = true
     end, 20)
 
-    self:DrawIcon("close", closeX + 7, wy + 12,
+    self:DrawIcon("close", closeX + 4, controlY,
         self.hovered == "close" and Theme.danger or Theme.textDim, 7)
-    self:Register("close", closeX, wy + 7, 25, 30, function() self:Shutdown() end, 20)
+    self:Register("close", closeX, wy, 25, wh - 2, function() self:Shutdown() end, 20)
 
     self:Register("window_drag", wx, wy, ww - 72, wh, function()
         self.draggingWindow = true
