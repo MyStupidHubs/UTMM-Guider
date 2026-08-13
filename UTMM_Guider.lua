@@ -4486,23 +4486,21 @@ function Gui:Button(id, label, x, y, w, h, callback, accent, z)
     self:Box(x, y, w, h, fill, true, z or 3, 6)
     self:Box(x, y, w, h, accent and Theme.accent or Theme.border, false, (z or 3) + 1, 6)
 
-    -- Centraliza pelo TextBounds real quando disponivel.
+    -- Matcha nao documenta TextBounds para Drawing.Text. Usar essa propriedade
+    -- produzia alturas inconsistentes entre redraws/builds. A centralizacao usa
+    -- apenas FontSize e a altura conhecida do botao, com compensacao optica fixa.
     local fontSize = 12
-    local textObj = self:Text(label, x + w * 0.5, y, Theme.text, fontSize, true, true, (z or 3) + 2)
-    if textObj then
-        local textHeight = fontSize
-        pcall(function()
-            local bounds = textObj.TextBounds
-            if bounds and type(bounds.Y) == "number" and bounds.Y > 0 then
-                textHeight = bounds.Y
-            end
-        end)
-
-        -- A fonte SystemBold do Drawing/Matcha desenha os glifos alguns pixels
-        -- acima da Position informada. +6 compensa essa baseline visual.
-        local textY = y + math.floor((h - textHeight) * 0.5) + 6
-        safeSet(textObj, "Position", Vector2.new(math.floor(x + w * 0.5), math.floor(textY)))
-    end
+    local textY = y + math.floor((h - fontSize) * 0.5) + 3
+    self:Text(
+        label,
+        math.floor(x + w * 0.5),
+        math.floor(textY),
+        Theme.text,
+        fontSize,
+        true,
+        true,
+        (z or 3) + 2
+    )
 
     self:Register(id, x, y, w, h, callback, (z or 3) + 2)
 end
