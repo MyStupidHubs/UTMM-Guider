@@ -70,7 +70,7 @@ local pendingJob = nil
 -- TRANSLATIONS  (portado 1:1 do original)
 ----------------------------------------------------------------
 
-local CurrentLanguage = "PT"
+local CurrentLanguage = "EN"
 local Translations = {
     PT = {
         Title = "UTMM Kit Scanner", Subtitle = "Farm Guider & Item Finder",
@@ -274,7 +274,7 @@ local INPUT_IDS = {
 
 -- Preferencias usadas pela UI Drawing e pela logica funcional.
 local WIDGET_DEFAULTS = {
-    utmm_lang        = 0,
+    utmm_lang        = 1,
     utmm_level       = "0",
     utmm_resets      = "0",
     utmm_tr          = "0",
@@ -4275,6 +4275,10 @@ local Gui = {
     logoData = nil,
     logoLoading = false,
     logoFailed = false,
+    logoObject = nil,
+    minimized = false,
+    minimizedWidth = 286,
+    minimizedHeight = 46,
     window = {
         x = 180, y = 90,
         width = 820, height = 600,
@@ -4432,6 +4436,32 @@ function Gui:Image(data, x, y, w, h, z)
     return o
 end
 
+function Gui:DrawLogoImage(x, y, w, h, z)
+    if type(self.logoData) ~= "string" or self.logoData == "" then return false end
+
+    if not self.logoObject then
+        local ok, image = pcall(function() return Drawing.new("Image") end)
+        if not ok or not image then return false end
+        self.logoObject = image
+
+        -- Data e atribuida uma unica vez. Reatribuir os bytes em cada redraw
+        -- causa piscadas em algumas builds do Drawing do Matcha.
+        safeSet(image, "Data", self.logoData)
+        safeSet(image, "Rounding", 8)
+    end
+
+    safeSet(self.logoObject, "Position", Vector2.new(math.floor(x), math.floor(y)))
+    safeSet(self.logoObject, "Size", Vector2.new(math.floor(w), math.floor(h)))
+    safeSet(self.logoObject, "ZIndex", z or 5)
+    safeSet(self.logoObject, "Transparency", 1)
+    safeSet(self.logoObject, "Visible", true)
+    return true
+end
+
+function Gui:HideLogoImage()
+    if self.logoObject then safeSet(self.logoObject, "Visible", false) end
+end
+
 function Gui:Register(id, x, y, w, h, callback, priority)
     if w <= 0 or h <= 0 then return end
     self.hitboxes[#self.hitboxes + 1] = {
@@ -4459,7 +4489,23 @@ function Gui:Button(id, label, x, y, w, h, callback, accent, z)
         or (hovered and Theme.hover or Theme.panel2)
     self:Box(x, y, w, h, fill, true, z or 3, 6)
     self:Box(x, y, w, h, accent and Theme.accent or Theme.border, false, (z or 3) + 1, 6)
-    self:Text(label, x + w * 0.5, y + math.floor((h - 13) * 0.5), Theme.text, 12, true, true, (z or 3) + 2)
+
+    -- Matcha nao documenta TextBounds para Drawing.Text. Usar essa propriedade
+    -- produzia alturas inconsistentes entre redraws/builds. A centralizacao usa
+    -- apenas FontSize e a altura conhecida do botao, com compensacao optica fixa.
+    local fontSize = 12
+    local textY = y + math.floor((h - fontSize) * 0.5) + 6
+    self:Text(
+        label,
+        math.floor(x + w * 0.5),
+        math.floor(textY),
+        Theme.text,
+        fontSize,
+        true,
+        true,
+        (z or 3) + 2
+    )
+
     self:Register(id, x, y, w, h, callback, (z or 3) + 2)
 end
 
@@ -4485,7 +4531,14 @@ function Gui:Cycle(id, label, options, x, y, w)
     self:Box(x, by, w, 27, Theme.panel2, true, 5, 6)
     self:Box(x, by, w, 27, Theme.border, false, 6, 6)
     self:Text(options[index + 1] or "-", x + 9, by + 6, Theme.text, 12, false, false, 7)
-    self:Text("›", x + w - 13, by + 5, Theme.textDim, 16, true, true, 7)
+
+    -- Chevron desenhado com linhas. O glifo "›" nao existe em algumas fontes
+    -- do Drawing/Matcha e acaba aparecendo como "?".
+    local arrowX = x + w - 13
+    local arrowY = by + 13
+    self:Line(arrowX - 3, arrowY - 2, arrowX, arrowY + 1, Theme.textDim, 1, 7)
+    self:Line(arrowX, arrowY + 1, arrowX + 3, arrowY - 2, Theme.textDim, 1, 7)
+
     self:Register("cycle:" .. id, x, by, w, 27, function()
         uiCache[id] = (index + 1) % #options
         saveConfig()
@@ -4668,6 +4721,11 @@ function Gui:DrawIcon(kind, x, y, color, z)
     elseif kind == "close" then
         self:Line(x + 3, y + 3, x + 15, y + 15, c, 2, z)
         self:Line(x + 15, y + 3, x + 3, y + 15, c, 2, z)
+    elseif kind == "minimize" then
+        self:Line(x + 3, y + 13, x + 15, y + 13, c, 2, z)
+    elseif kind == "restore" then
+        self:Box(x + 3, y + 4, 12, 10, c, false, z, 1)
+        self:Line(x + 5, y + 6, x + 13, y + 6, c, 1, z)
     elseif kind == "searchbutton" then
         self:Circle(x + 7, y + 7, 5, c, false, 2, z)
         self:Line(x + 11, y + 11, x + 16, y + 16, c, 2, z)
@@ -4772,13 +4830,13 @@ function Gui:DrawSidebar(wx, wy, ww, wh)
     self:Line(wx + sw, wy + 1, wx + sw, wy + wh - 1, Theme.borderSoft, 1, 3)
 
     self:Box(wx + 14, wy + 13, 42, 42, Theme.panel, true, 3, 9)
-    if self.logoData then
-        self:Image(self.logoData, wx + 16, wy + 15, 38, 38, 5)
-    else
+    if not self:DrawLogoImage(wx + 16, wy + 15, 38, 38, 5) then
         self:DrawFallbackLogo(wx + 18, wy + 17, 34)
     end
-    self:Text("UTMM", wx + 66, wy + 16, Theme.text, 15, false, true, 5)
-    self:Text("GUIDER", wx + 66, wy + 34, Theme.textDim, 12, false, true, 5)
+
+    self:Text("UTMM GUIDER", wx + 66, wy + 18, Theme.text, 13, false, true, 5)
+    self:Text(CurrentLanguage == "PT" and "Progressão & Builds" or "Progression & Builds",
+        wx + 66, wy + 36, Theme.textDim, 9, false, false, 5)
 
     self:Text(CurrentLanguage == "PT" and "NAVEGAÇÃO" or "NAVIGATION", wx + 16, wy + 78, Theme.textMuted, 10, false, true, 5)
     local y = wy + 99
@@ -4823,13 +4881,31 @@ function Gui:DrawHeader(wx, wy, ww)
     self:Box(hx, wy, ww - sw, self.window.header, Theme.shell, true, 2, 12)
     self:Line(hx, wy + self.window.header, wx + ww, wy + self.window.header, Theme.borderSoft, 1, 3)
     self:Text(self:PageName(self.selectedPage), hx + 18, wy + 14, Theme.text, 14, false, true, 5)
-    local status = self.pageBusy[self.selectedPage] and Lang.Searching or "Matcha LuaVM"
-    self:Text(status, wx + ww - 64, wy + 15, self.pageBusy[self.selectedPage] and Theme.warning or Theme.textMuted, 10, true, false, 5)
 
-    local cx = wx + ww - 32
-    self:DrawIcon("close", cx + 7, wy + 12, self.hovered == "close" and Theme.danger or Theme.textDim, 7)
-    self:Register("close", cx, wy + 7, 25, 27, function() self:Shutdown() end, 20)
-    self:Register("window_drag", hx, wy, ww - sw - 42, self.window.header, function()
+    -- O status da tarefa ja aparece junto dos resultados. Nao duplica no header.
+    local minX = wx + ww - 62
+    local closeX = wx + ww - 32
+
+    local headerCenterY = wy + (self.window.header * 0.5)
+    self:DrawIcon("minimize", minX + 5, math.floor(headerCenterY - 13),
+        self.hovered == "minimize" and Theme.text or Theme.textDim, 7)
+    self:Register("minimize", minX, wy, 25, self.window.header, function()
+        self:BlurInput(true)
+        self.overlay = nil
+        self.minimized = true
+        self.draggingResize = false
+        self.draggingResultScroll = false
+        self.draggingOverlayScroll = false
+        self.resultMetrics = nil
+        self.overlayMetrics = nil
+        self.dirty = true
+    end, 20)
+
+    self:DrawIcon("close", closeX + 4, math.floor(headerCenterY - 9),
+        self.hovered == "close" and Theme.danger or Theme.textDim, 7)
+    self:Register("close", closeX, wy, 25, self.window.header, function() self:Shutdown() end, 20)
+
+    self:Register("window_drag", hx, wy, ww - sw - 78, self.window.header, function()
         self.draggingWindow = true
         self.dragDX = Mouse.X - self.window.x
         self.dragDY = Mouse.Y - self.window.y
@@ -5295,11 +5371,67 @@ function Gui:DrawOverlay(wx, wy, ww, wh)
     end
 end
 
+function Gui:RenderMinimized()
+    self:BeginFrame()
+    self.resultMetrics = nil
+    self.overlayMetrics = nil
+
+    local wx, wy = self.window.x, self.window.y
+    local ww, wh = self.minimizedWidth, self.minimizedHeight
+    local centerY = wy + (wh * 0.5)
+
+    self:Box(wx, wy, ww, wh, Theme.shell, true, 1, 10)
+    self:Box(wx, wy, ww, wh, Theme.border, false, 2, 10)
+    self:Box(wx, wy + wh - 2, ww, 2, Theme.accentSoft, true, 3, 1)
+
+    -- Logo sem moldura extra: fica geometricamente centralizado na barra.
+    local logoSize = 30
+    local logoX = wx + 10
+    local logoY = math.floor(centerY - (logoSize * 0.5))
+    if not self:DrawLogoImage(logoX, logoY, logoSize, logoSize, 6) then
+        self:DrawFallbackLogo(logoX + 1, logoY + 1, logoSize - 2)
+    end
+
+    self:Text("UTMM GUIDER", wx + 50, math.floor(centerY - 10), Theme.text, 13, false, true, 6)
+    self:Text(self:PageName(self.selectedPage), wx + 50, math.floor(centerY + 7), Theme.textDim, 9, false, false, 6)
+
+    local restoreX = wx + ww - 62
+    local closeX = wx + ww - 32
+    local controlY = math.floor(centerY - 9)
+
+    -- DrawIcon usa uma caixa conceitual de 18x18; ambos ficam no mesmo centro.
+    self:DrawIcon("restore", restoreX + 4, controlY,
+        self.hovered == "restore" and Theme.accent or Theme.textDim, 7)
+    self:Register("restore", restoreX, wy, 25, wh - 2, function()
+        self.minimized = false
+        self.dirty = true
+    end, 20)
+
+    self:DrawIcon("close", closeX + 4, controlY,
+        self.hovered == "close" and Theme.danger or Theme.textDim, 7)
+    self:Register("close", closeX, wy, 25, wh - 2, function() self:Shutdown() end, 20)
+
+    self:Register("window_drag", wx, wy, ww - 72, wh, function()
+        self.draggingWindow = true
+        self.dragDX = Mouse.X - self.window.x
+        self.dragDY = Mouse.Y - self.window.y
+    end, 2)
+
+    self:EndFrame()
+    self.dirty = false
+end
+
 function Gui:Render()
     if not self.visible then
         for _, list in pairs(self.pool) do
             for _, obj in ipairs(list) do safeSet(obj, "Visible", false) end
         end
+        self:HideLogoImage()
+        return
+    end
+
+    if self.minimized then
+        self:RenderMinimized()
         return
     end
 
@@ -5470,6 +5602,10 @@ function Gui:Shutdown()
     end
     self.pool = {}
     self.hitboxes = {}
+    if self.logoObject then
+        pcall(function() self.logoObject:Remove() end)
+        self.logoObject = nil
+    end
 end
 
 Gui:LoadLogo()
