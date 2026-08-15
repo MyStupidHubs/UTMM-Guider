@@ -130,6 +130,7 @@ local Translations = {
         -- Textos da aba de analise de equipamento.
         Build = "Build", BuildScan = "ANALISAR BUILD",
         BuildDesc = "Lê suas armas/armaduras e aponta a melhor",
+        BuildGearSection = "BUILD DE EQUIPAMENTO",
         BestWeapon = "Melhor Arma:", BestArmor = "Melhor Armadura:",
         -- Separa dano confirmado do cenario hipotetico de DamageIncrease.
         BestWeaponConfirmed = "Melhor Arma (dano confirmado):",
@@ -138,6 +139,7 @@ local Translations = {
         BuildSameBoostWinner = "Também é a melhor considerando DamageIncrease",
         -- Build / tierlist de comidas.
         BestFood = "Melhor Comida:", FoodSection = "COMIDAS",
+        FoodDesc = "Build, ranking e gerenciamento das suas comidas",
         FoodBest8 = "MELHORES 8 COMIDAS", FoodTierList = "TIERLIST DE COMIDAS",
         FoodBuildTitle = "BUILD DE 8 COMIDAS", FoodTierTitle = "TIERLIST DE COMIDAS",
         FoodHeal = "Cura", FoodCost = "Custo", FoodMax = "Máximo",
@@ -219,6 +221,7 @@ local Translations = {
         -- Texts for the gear analysis page.
         Build = "Build", BuildScan = "ANALYZE BUILD",
         BuildDesc = "Reads your weapons/armors and points the best",
+        BuildGearSection = "EQUIPMENT BUILD",
         BestWeapon = "Best Weapon:", BestArmor = "Best Armor:",
         -- Separates confirmed damage from the hypothetical DamageIncrease scenario.
         BestWeaponConfirmed = "Best Weapon (confirmed damage):",
@@ -227,6 +230,7 @@ local Translations = {
         BuildSameBoostWinner = "Also the best when considering DamageIncrease",
         -- Food build / tier list.
         BestFood = "Best Food:", FoodSection = "FOODS",
+        FoodDesc = "Food build, ranking and management",
         FoodBest8 = "BEST 8 FOODS", FoodTierList = "FOOD TIER LIST",
         FoodBuildTitle = "8-FOOD BUILD", FoodTierTitle = "FOOD TIER LIST",
         FoodHeal = "Heal", FoodCost = "Cost", FoodMax = "Max",
@@ -5645,6 +5649,10 @@ function Gui:DrawPageControls(cx, cy, cw)
         y = y + 38
 
     elseif page == 5 then
+        -- Modulo 1: Build de equipamento. Armas/armaduras ficam visualmente
+        -- separadas das ferramentas de comida, apesar de compartilharem a aba.
+        self:Text(Lang.BuildGearSection, cx, y, Theme.text, 11, false, true, 5)
+        y = y + 18
         self:Text(Lang.BuildDesc, cx, y, Theme.textDim, 11, false, false, 5)
         y = y + 20
         local comboW = math.min(190, math.floor(cw * 0.42))
@@ -5653,6 +5661,23 @@ function Gui:DrawPageControls(cx, cy, cw)
             self:QueueJob(5, function() runBuildScan() end, true)
         end, true, 6)
         y = y + 54
+
+        -- Resumo exclusivo de equipamento fica dentro do primeiro modulo.
+        local bestW = state.buildWeapon or "-"
+        local bestA = state.buildArmor or "-"
+        self:Text(Lang.BestWeaponConfirmed .. " " .. string.sub(bestW, 1, 45), cx, y, Theme.textDim, 9, false, false, 5)
+        self:Text(Lang.BestArmor .. " " .. string.sub(bestA, 1, 42), cx, y + 14, Theme.textMuted, 9, false, false, 5)
+        y = y + 36
+
+        -- Separador forte: comidas sao um modulo independente da analise de
+        -- armas/armaduras, assim como What's Missing foi separado da Progressao.
+        self:Line(cx, y, cx + cw, y, Theme.border, 1, 4)
+        y = y + 13
+        self:Text(Lang.FoodSection, cx, y, Theme.text, 11, false, true, 5)
+        y = y + 18
+        self:Text(Lang.FoodDesc, cx, y, Theme.textDim, 10, false, false, 5)
+        y = y + 21
+
         local half = math.floor((cw - 8) * 0.5)
         self:Button("food:8", Lang.FoodBest8, cx, y, half, 28, function()
             self:QueueJob(5, function() runFoodBest8() end, true)
@@ -5664,13 +5689,13 @@ function Gui:DrawPageControls(cx, cy, cw)
         self:Button("manage:food", Lang.FoodBlacklistTitle .. " (" .. #foodBlacklistOrder .. ")", cx, y, math.min(240, cw), 27, function()
             self:OpenManager("food")
         end, false, 6)
-        y = y + 33
-        local bestW = state.buildWeapon or "-"
-        local bestA = state.buildArmor or "-"
+        y = y + 34
+
+        -- Melhor comida agora aparece junto das ferramentas de comida, e nao
+        -- misturada na mesma linha do resumo de armadura.
         local bestF = state.buildFood or "-"
-        self:Text(Lang.BestWeaponConfirmed .. " " .. string.sub(bestW, 1, 45), cx, y, Theme.textDim, 9, false, false, 5)
-        self:Text(Lang.BestArmor .. " " .. string.sub(bestA, 1, 30) .. " | " .. Lang.BestFood .. " " .. string.sub(bestF, 1, 24), cx, y + 14, Theme.textMuted, 9, false, false, 5)
-        y = y + 31
+        self:Text(Lang.BestFood .. " " .. string.sub(bestF, 1, 50), cx, y, Theme.textMuted, 9, false, false, 5)
+        y = y + 25
 
     elseif page == 6 then
         self:Text(Lang.Top5Title, cx, y, Theme.text, 12, false, true, 5)
