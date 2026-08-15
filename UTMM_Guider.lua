@@ -5,6 +5,15 @@ if Drawing == nil or type(Drawing.new) ~= "function" then
     assert(false, "[UTMM Guider] Drawing.new nao esta disponivel nesta build do Matcha.")
 end
 
+-- Reexecucao segura: encerra a instancia anterior antes de criar novos
+-- Drawings, conexoes e workers. O ambiente global e compartilhado pelo Matcha.
+pcall(function()
+    if type(_G) == "table" and type(_G.__UTMM_GUIDER_SHUTDOWN) == "function" then
+        _G.__UTMM_GUIDER_SHUTDOWN()
+        _G.__UTMM_GUIDER_SHUTDOWN = nil
+    end
+end)
+
 ----------------------------------------------------------------
 -- SERVICOS / CONSTANTES / ESTADO
 ----------------------------------------------------------------
@@ -65,6 +74,16 @@ local state = {
 --            clique: o clique so enfileira, e uma thread propria executa entre
 --            frames, evitando travar o renderer Drawing.
 local pendingJob = nil
+
+-- Geracao da fila. Scans longos cedem cooperativamente em pontos seguros;
+-- se outro pedido chegar, o antigo e interrompido antes de publicar resultados.
+state.requestId = 0
+state.activeRequestId = nil
+state.cancelToken = "[UTMM_SCAN_CANCELLED]"
+state.scanCheckpoint = function(shouldYield)
+    if shouldYield then wait(0) end
+    assert(state.activeRequestId == state.requestId, state.cancelToken)
+end
 
 ----------------------------------------------------------------
 -- TRANSLATIONS  (portado 1:1 do original)
@@ -1051,62 +1070,180 @@ local function readText(gui, childName)
     return txt
 end
 
--- Uma unica chamada a Workspace:GetDescendants() por scan.
--- O snapshot e a fonte comum para BattleInfoGui E para localizar lojas.
--- IMPORTANTE: nao existe caminho presumido de loja. Shop.Value e apenas o
--- nome a procurar em QUALQUER lugar do Workspace.
+-- Indice dinamico do Workspace: o primeiro scan e qualquer mudanca estrutural
+-- fazem uma passagem integral, sem presumir pasta/hierarquia. Depois, as raizes
+-- de fato observadas sao reescaneadas com wrappers frescos. Um GetDescendants
+-- global leve continua validando contagem + assinatura dos filhos de Workspace;
+-- bosses novos/removidos nas raizes entram imediatamente, e uma raiz nova
+-- invalida o indice e volta automaticamente para a passagem integral.
 local workspaceScanCache = nil
+state.workspaceBattleRoots = nil
+state.workspaceDescendantCount = nil
+state.workspaceTopSignature = nil
 
 -- Conjunto opcional de nomes de loja conhecidos antes da
 -- varredura. Guarda forma EXATA e minuscula. Na maioria dos objetos o teste
 -- exato resolve sem executar string.lower() em cada uma das ~200k Instances.
 local workspaceShopWanted = nil -- { exact = {}, lower = {} }
 
-local function collectBattleGuis()
-    if workspaceScanCache then return workspaceScanCache.battleGuis end
-
-    local out = {}
-    local shopNodes = {}
-    local ok, descendants = pcall(function() return Workspace:GetDescendants() end)
-    if not ok or type(descendants) ~= "table" then
-        workspaceScanCache = { descendants = {}, battleGuis = {}, shopNodes = {} }
-        return out
+local function collectWorkspaceSnapshot(forceFull)
+    if workspaceScanCache and (not forceFull or workspaceScanCache.full) then
+        return workspaceScanCache
     end
 
-    for _, inst in pairs(descendants) do
-        local okName, nm = pcall(function() return inst.Name end)
-        if okName and type(nm) == "string" then
-            if nm == "BattleInfoGui" then
-                out[#out + 1] = inst
+    local function readName(inst)
+        local ok, name = pcall(function() return inst.Name end)
+        if ok and type(name) == "string" then return name end
+        local ok2, name2 = pcall(function() return inst.Name end)
+        if ok2 and type(name2) == "string" then return name2 end
+        return nil
+    end
+
+    local function readAddress(inst)
+        local ok, address = pcall(function() return inst.Address end)
+        if ok and address ~= nil then return tostring(address) end
+        return nil
+    end
+
+    local descendants = workspaceScanCache and workspaceScanCache.allDescendants or nil
+    if not descendants then
+        local ok, list = pcall(function() return Workspace:GetDescendants() end)
+        if not ok or type(list) ~= "table" then
+            ok, list = pcall(function() return Workspace:GetDescendants() end)
+        end
+        descendants = (ok and type(list) == "table") and list or {}
+    end
+
+    local okTop, topChildren = pcall(function() return Workspace:GetChildren() end)
+    if not okTop or type(topChildren) ~= "table" then topChildren = {} end
+    local signatureParts = {}
+    for _, child in pairs(topChildren) do
+        signatureParts[#signatureParts + 1] = (readAddress(child) or "?") .. ":" .. (readName(child) or "?")
+    end
+    table.sort(signatureParts)
+    local topSignature = table.concat(signatureParts, "|")
+
+    local full = forceFull == true
+        or type(state.workspaceBattleRoots) ~= "table"
+        or #state.workspaceBattleRoots == 0
+        or state.workspaceDescendantCount ~= #descendants
+        or state.workspaceTopSignature ~= topSignature
+
+    local battleGuis, scanList = {}, descendants
+    if not full then
+        scanList = {}
+        local topByAddress, topByName = {}, {}
+        for _, child in pairs(topChildren) do
+            local address, name = readAddress(child), readName(child)
+            if address then topByAddress[address] = child end
+            if name then
+                topByName[name] = topByName[name] or {}
+                topByName[name][#topByName[name] + 1] = child
+            end
+        end
+
+        local rootSeen = {}
+        for _, rootInfo in ipairs(state.workspaceBattleRoots) do
+            local root = rootInfo.address and topByAddress[rootInfo.address] or nil
+            if not root and rootInfo.name and topByName[rootInfo.name]
+                and #topByName[rootInfo.name] == 1 then
+                root = topByName[rootInfo.name][1]
+            end
+            if not root then
+                full = true
+                break
             end
 
-            if workspaceShopWanted then
-                local matchedKey = nil
-                if workspaceShopWanted.exact and workspaceShopWanted.exact[nm] then
-                    matchedKey = workspaceShopWanted.exact[nm]
-                elseif workspaceShopWanted.lower then
-                    local lowerName = string.lower(nm)
-                    if workspaceShopWanted.lower[lowerName] then matchedKey = lowerName end
+            local rootKey = rootInfo.address or (rootInfo.name .. ":" .. tostring(rootInfo.order or 0))
+            if not rootSeen[rootKey] then
+                rootSeen[rootKey] = true
+                if readName(root) == "BattleInfoGui" then battleGuis[#battleGuis + 1] = root end
+                local okKids, kids = pcall(function() return root:GetDescendants() end)
+                if not okKids or type(kids) ~= "table" then
+                    full = true
+                    break
                 end
-
-                if matchedKey then
-                    local list = shopNodes[matchedKey]
-                    if not list then
-                        list = {}
-                        shopNodes[matchedKey] = list
-                    end
-                    list[#list + 1] = inst
-                end
+                for _, inst in pairs(kids) do scanList[#scanList + 1] = inst end
             end
         end
     end
 
+    local names, shopNodes = {}, {}
+    if full then
+        battleGuis = {}
+        scanList = descendants
+    end
+
+    local scanned = 0
+    for index, inst in pairs(scanList) do
+        scanned = scanned + 1
+        if scanned % 2048 == 0 then state.scanCheckpoint(true) end
+        local name = readName(inst)
+        names[index] = name
+        if name == "BattleInfoGui" then battleGuis[#battleGuis + 1] = inst end
+
+        if full and name and workspaceShopWanted then
+            local matchedKey = workspaceShopWanted.exact and workspaceShopWanted.exact[name] or nil
+            if not matchedKey and workspaceShopWanted.lower then
+                local lowerName = string.lower(name)
+                if workspaceShopWanted.lower[lowerName] then matchedKey = lowerName end
+            end
+            if matchedKey then
+                local nodes = shopNodes[matchedKey]
+                if not nodes then nodes = {}; shopNodes[matchedKey] = nodes end
+                nodes[#nodes + 1] = inst
+            end
+        end
+    end
+
+    if full then
+        local roots, rootKeys = {}, {}
+        local unresolvedRoot = false
+        local workspaceAddress = readAddress(Workspace)
+        for _, gui in ipairs(battleGuis) do
+            local node, top = gui, nil
+            for _ = 1, 64 do
+                local okParent, parent = pcall(function() return node.Parent end)
+                if not okParent or not parent then break end
+                local parentAddress = readAddress(parent)
+                local parentName = readName(parent)
+                if (workspaceAddress and parentAddress == workspaceAddress)
+                    or (not workspaceAddress and parentName == "Workspace") then
+                    top = node
+                    break
+                end
+                node = parent
+            end
+            if top then
+                local address, name = readAddress(top), readName(top)
+                local key = address or (name and (name .. ":" .. tostring(#roots + 1)))
+                if key and not rootKeys[key] then
+                    rootKeys[key] = true
+                    roots[#roots + 1] = { address = address, name = name, order = #roots + 1 }
+                end
+            else
+                unresolvedRoot = true
+            end
+        end
+        if unresolvedRoot then roots = {} end
+        state.workspaceBattleRoots = roots
+        state.workspaceDescendantCount = #descendants
+        state.workspaceTopSignature = topSignature
+    end
+
     workspaceScanCache = {
-        descendants = descendants,
-        battleGuis = out,
+        allDescendants = descendants,
+        descendants = full and descendants or scanList,
+        names = names,
+        battleGuis = battleGuis,
         shopNodes = shopNodes,
+        full = full,
     }
-    return out
+    return workspaceScanCache
+end
+
+local function collectBattleGuis()
+    return collectWorkspaceSnapshot().battleGuis
 end
 
 ----------------------------------------------------------------
@@ -1304,7 +1441,7 @@ local function invalidateCatalog()
     catalogCache.frags = nil
     catalogCache.player = nil
     catalogCache.shopTargets = nil
-    -- Cada novo scan tira uma fotografia nova do Workspace.
+    -- Cada novo scan tira fotografias novas apenas das partes dinamicas.
     workspaceScanCache = nil
     workspaceShopWanted = nil
 end
@@ -1494,6 +1631,16 @@ local function shopInfo(folder)
     local shop   = readStringValue(safeChild(folder, "Shop"))
     local cost   = readNumberValue(firstChild(folder, { "Cost", "Price" }), nil)
 
+    -- Registra antecipadamente todos os nomes conhecidos. Quando algum
+    -- resultado realmente precisar de TP, uma unica fotografia global consegue
+    -- indexar todas as lojas do scan, inclusive para Build/Food/Faltantes.
+    if shop and shop ~= "" then
+        local key = string.lower(shop)
+        workspaceShopWanted = workspaceShopWanted or { exact = {}, lower = {} }
+        workspaceShopWanted.exact[shop] = key
+        workspaceShopWanted.lower[key] = true
+    end
+
     -- Onsale=false e definitivo. Se Onsale nao leu, Shop preenchido ainda
     -- e evidência suficiente para considerar o item ligado a uma loja.
     if onsale == false then return nil end
@@ -1658,7 +1805,10 @@ local function appendShopPartsFromSnapshot(out, seen, container)
     pcall(function() containerFull = cleanText(container:GetFullName()) end)
     local prefix = containerFull and (containerFull .. ".") or nil
 
+    local scanned = 0
     for _, candidate in pairs(descendants) do
+        scanned = scanned + 1
+        if scanned % 2048 == 0 then state.scanCheckpoint(true) end
         if isShopPart(candidate) then
             local belongs = false
 
@@ -1714,7 +1864,7 @@ local function findShopTargets(shopName)
     workspaceShopWanted.exact[clean] = key
     workspaceShopWanted.lower[key] = true
 
-    if not workspaceScanCache then collectBattleGuis() end
+    if not workspaceScanCache or not workspaceScanCache.full then collectWorkspaceSnapshot(true) end
 
     local nodes = {}
     local indexed = workspaceScanCache and workspaceScanCache.shopNodes
@@ -1725,8 +1875,12 @@ local function findShopTargets(shopName)
     else
         -- Snapshot ja existente: percorre somente a tabela em memoria.
         local descendants = (workspaceScanCache and workspaceScanCache.descendants) or {}
-        for _, node in pairs(descendants) do
-            local nm = safeName(node)
+        local cachedNames = (workspaceScanCache and workspaceScanCache.names) or {}
+        local scanned = 0
+        for index, node in pairs(descendants) do
+            scanned = scanned + 1
+            if scanned % 2048 == 0 then state.scanCheckpoint(true) end
+            local nm = cachedNames[index]
             if nm and (nm == clean or string.lower(nm) == key) then
                 nodes[#nodes + 1] = node
             end
@@ -1857,12 +2011,23 @@ local function foodStats(itemName, folder)
     local rawShop = readStringValue(safeChild(folder, "Shop"))
     local permanent, truePermanent = itemPermanence(folder)
 
+    if rawShop and rawShop ~= "" then
+        local key = string.lower(rawShop)
+        workspaceShopWanted = workspaceShopWanted or { exact = {}, lower = {} }
+        workspaceShopWanted.exact[rawShop] = key
+        workspaceShopWanted.lower[key] = true
+    end
+
     -- A localizacao da loja e independente do Onsale. Uma comida
     -- pode estar fora de venda agora e ainda ter Shop.Value configurado; isso e
     -- util na tierlist para permitir visitar a loja mesmo assim.
     local shopTarget = nil
     if rawShop and rawShop ~= "" then
         shopTarget = { shop = rawShop, cost = cost, sure = (onsale == true) }
+    end
+    local acquisitionShop = nil
+    if onsale ~= false and (onsale == true or (rawShop and rawShop ~= "")) then
+        acquisitionShop = { shop = rawShop, cost = cost, sure = (onsale == true) }
     end
 
     return {
@@ -1875,7 +2040,7 @@ local function foodStats(itemName, folder)
         shopName = rawShop,
         -- shop = fonte de aquisicao real (respeita Onsale); shopTarget = apenas
         -- localizacao para TP, mesmo quando a comida nao esta a venda.
-        shop = shopInfo(folder),
+        shop = acquisitionShop,
         shopTarget = shopTarget,
         permanent = permanent, truePermanent = truePermanent,
         missing = (heal == nil),
@@ -1949,7 +2114,8 @@ local function allBattles()
     if catalogCache.battles then return catalogCache.battles end
     local out = {}
     local root = catalogFolder("Battles")
-    for _, folder in ipairs(safeChildren(root)) do
+    for i, folder in ipairs(safeChildren(root)) do
+        if i % 64 == 0 then state.scanCheckpoint(true) end
         local okRead, b = pcall(readBattle, folder)
         if okRead and b then out[#out + 1] = b end
     end
@@ -2188,13 +2354,13 @@ local function anyDisplayName(folder)
     return referenceFolderName(folder)
 end
 
-local function battleRewardLine(b)
+local function battleRewardLine(b, rewardName, fragmentName)
     local p = {}
     if b.gold and b.gold > 0 then p[#p + 1] = "Gold:" .. formatNumber(b.gold) end
     if b.exp and b.exp > 0 then p[#p + 1] = "Exp:" .. formatNumber(b.exp) end
-    local rn = anyDisplayName(b.reward)
+    local rn = rewardName or anyDisplayName(b.reward)
     if rn then p[#p + 1] = Lang.Item .. ":" .. rn end
-    local fn = anyDisplayName(b.fragment)
+    local fn = fragmentName or anyDisplayName(b.fragment)
     if fn then p[#p + 1] = Lang.Frags .. ":" .. fn end
     if #p == 0 then return Lang.NoRewards end
     return table.concat(p, " | ")
@@ -2258,7 +2424,8 @@ local function collectBosses()
 
     -- 1) Fonte primaria: Lighting.Battles. Cada PASTA e um registro unico;
     -- nomes nunca sao usados como chave primaria, evitando colisao entre bosses.
-    for _, b in ipairs(allBattles()) do
+    for i, b in ipairs(allBattles()) do
+        if i % 64 == 0 then state.scanCheckpoint(true) end
         local rec = {
             name = b.battleName or b.folderName or "?", battle = b,
             lvl = b.lvl, r = b.r, tr = b.tr, gold = b.gold, baseGold = b.gold, exp = b.exp,
@@ -2274,7 +2441,8 @@ local function collectBosses()
     -- IMPORTANTE: nao exige mais MonsterName/LV legiveis para casar.
     -- Se o texto estiver bugado, LinkedBattle/owner ainda consegue anexar o GUI
     -- ao registro do Lighting e restaurar o TP mesmo quando uma das fontes vier corrompida.
-    for _, gui in ipairs(collectBattleGuis()) do
+    for i, gui in ipairs(collectBattleGuis()) do
+        if i % 32 == 0 then state.scanCheckpoint(true) end
         local nameTxt = readText(gui, "MonsterName")
         local lvlTxt  = readText(gui, "LVRequired")
         local b = resolveBattle(gui, nameTxt, lvlTxt)
@@ -2347,6 +2515,7 @@ local function collectBosses()
         -- nome mostrado so vem dele se estiver legivel; caso contrario o texto
         -- do gui continua sendo usado para apresentar o item.
         local lightingRewardName = b and anyDisplayName(b.reward) or nil
+        rec.rewardName = lightingRewardName
         -- O simples fato de RewardWeapon ser um ObjectValue nao
         -- prova que o boss dropa item: muitos Battles mantem o ObjectValue
         -- presente com Value vazio/ilegivel. Scanner so considera reward real
@@ -2367,7 +2536,7 @@ local function collectBosses()
             parts[#parts + 1] = Lang.Item .. ":" .. lightingRewardName
             rec.rewardLine = table.concat(parts, " | ")
         elseif rec.rewards == "" and b then
-            rec.rewardLine = battleRewardLine(b)
+            rec.rewardLine = battleRewardLine(b, lightingRewardName, lightingSoul)
         end
     end
 
@@ -2485,8 +2654,11 @@ local ITEM_KINDS = {
 local function allCatalogItems()
     if catalogCache.items then return catalogCache.items end
     local out = {}
+    local scanned = 0
     for _, def in ipairs(ITEM_KINDS) do
         for _, folder in ipairs(safeChildren(catalogFolder(def.kind))) do
+            scanned = scanned + 1
+            if scanned % 64 == 0 then state.scanCheckpoint(true) end
             local fname = safeName(folder)
             if fname and fname ~= "" then
                 local permanent, truePermanent = itemPermanence(folder)
@@ -2496,7 +2668,7 @@ local function allCatalogItems()
                     folder = folder,
                     folderName = fname,
                     label = displayName(folder, def.kind, fname),
-                    shop = shopInfo(folder),
+                    shop = (def.kind ~= "Food") and shopInfo(folder) or nil,
                     permanent = permanent, truePermanent = truePermanent,
                 }
                 if def.kind == "SOULs" then
@@ -2524,6 +2696,7 @@ local function allCatalogItems()
                         entry.max = fs.max
                         entry.onsale = fs.onsale
                         entry.shopName = fs.shopName
+                        entry.shop = fs.shop
                     end
                 end
                 out[#out + 1] = entry
@@ -2756,6 +2929,7 @@ local function beginScan(kind)
 end
 
 local function endScan(count, kind)
+    state.scanCheckpoint(false)
     state.count = count
     if kind then state.countKind = kind end
     state.busy = false
@@ -3031,7 +3205,7 @@ local function findBestFarm(typeStr)
         if typeStr == "Gold" and c.exp and c.exp > 0 then
             farmParts[#farmParts + 1] = "Exp:" .. formatNumber(c.exp)
         end
-        local farmItem = c.battle and anyDisplayName(c.battle.reward) or nil
+        local farmItem = c.rewardName
         if farmItem then farmParts[#farmParts + 1] = Lang.Item .. ":" .. farmItem end
 
         addResult({
@@ -3521,36 +3695,32 @@ local function searchBoss(q)
     local count, found = 0, {}
     local ue = getToggle("utmm_utmoh")
 
-    -- Indice LEVE de Shop.Value. Nao chama allCatalogItems(),
-    -- resolveFragments() nem procura fontes de boss; le apenas os tres catalogos
-    -- e os Values Onsale/Shop/Cost. Os nomes alimentam a UNICA varredura global.
+    -- O catalogo e montado UMA vez e reaproveitado tanto pelo indice de lojas
+    -- quanto pela etapa de itens. Antes, os quatro roots eram lidos duas vezes.
     local shopMatches, shopByKey = {}, {}
     -- Todos os Shop.Value conhecidos sao preparados antes da
     -- varredura global. Assim collectBosses() consegue indexar lojas e
     -- BattleInfoGui na MESMA passada pelo Workspace.
     local allShopNames = { exact = {}, lower = {} }
-    for _, def in ipairs(ITEM_KINDS) do
-        for _, folder in ipairs(safeChildren(catalogFolder(def.kind))) do
-            local fname = safeName(folder)
-            local label = fname and displayName(folder, def.kind, fname) or nil
-
-            local info = shopInfo(folder)
-            local shopName = info and cleanText(info.shop) or nil
-            if shopName then
-                local allKey = string.lower(shopName)
-                allShopNames.exact[shopName] = allKey
-                allShopNames.lower[allKey] = true
+    local catalogItems = allCatalogItems()
+    for i, entry in ipairs(catalogItems) do
+        if i % 64 == 0 then state.scanCheckpoint(true) end
+        local info = entry.shop
+        local shopName = info and cleanText(info.shop) or nil
+        if shopName then
+            local allKey = string.lower(shopName)
+            allShopNames.exact[shopName] = allKey
+            allShopNames.lower[allKey] = true
+        end
+        if shopName and string.find(string.lower(shopName), sl, 1, true) then
+            local skey = string.lower(shopName)
+            local rec = shopByKey[skey]
+            if not rec then
+                rec = { name = shopName, items = 0, exact = (skey == sl) }
+                shopByKey[skey] = rec
+                shopMatches[#shopMatches + 1] = rec
             end
-            if shopName and string.find(string.lower(shopName), sl, 1, true) then
-                local skey = string.lower(shopName)
-                local rec = shopByKey[skey]
-                if not rec then
-                    rec = { name = shopName, items = 0, exact = (skey == sl) }
-                    shopByKey[skey] = rec
-                    shopMatches[#shopMatches + 1] = rec
-                end
-                rec.items = rec.items + 1
-            end
+            rec.items = rec.items + 1
         end
     end
 
@@ -3604,7 +3774,7 @@ local function searchBoss(q)
             if not m and b.rewards ~= "" and string.find(string.lower(b.rewards), sl, 1, true) then m = true end
             if not m and b.soul and string.find(string.lower(b.soul), sl, 1, true) then m = true end
             if not m and b.battle then
-                local rn = anyDisplayName(b.battle.reward)
+                local rn = b.rewardName
                 if rn and string.find(string.lower(rn), sl, 1, true) then m = true end
             end
 
@@ -3650,8 +3820,8 @@ local function searchBoss(q)
     -- ---------------- 3) itens ----------------
     -- allCatalogItems e montado apos bosses/lojas, mantendo a ordem de exibicao
     -- e reaproveitando os caches do mesmo scan.
-    local catalogItems = allCatalogItems()
-    for _, entry in ipairs(catalogItems) do
+    for i, entry in ipairs(catalogItems) do
+        if i % 64 == 0 then state.scanCheckpoint(true) end
         local hay = string.lower((entry.label or "") .. " " .. (entry.folderName or ""))
         if string.find(hay, sl, 1, true) then
             local key = tostring(entry.tag) .. tostring(entry.label)
@@ -4233,8 +4403,8 @@ end
 loadConfig()
 
 local RunService = getService("RunService")
-local UserInputService = getService("UserInputService")
 local Mouse = LocalPlayer and LocalPlayer:GetMouse() or nil
+local renderConnection
 
 if not RunService or not Mouse then
     assert(false, "[UTMM Guider] RunService/Mouse indisponivel no Matcha.")
@@ -4253,10 +4423,40 @@ local Gui = {
     hitboxes = {},
     pageData = {},
     pageBusy = {},
-    resultScroll = {},
+    pageRequestId = {},
+    resultScroll = {}, -- legado; o scroll principal agora e por pagina
     resultScrollMax = {},
+    pageScroll = {},
+    pageTargetScroll = {},
+    pageScrollMax = {},
+    pageVelocity = {},
+    pageMetrics = nil,
+    pageContentDrag = nil,
+    draggingPageScroll = false,
+    pageScrollGrab = 0,
+    lastDt = 1 / 60,
+    renderClip = nil,
     activeInput = nil,
+    robloxInputBlocked = false,
+    -- INSui real: mouseScroll e um buffer consumido pelo motor de scroll.
+    -- O proprio INSui fornecido nao possui um produtor da rodinha fisica.
+    mouseScroll = 0,
+    mouseScrollBridge = nil,
+    inputEventsAvailable = false,
+    pendingTextKeys = {},
+    focusedKeys = {},
+    polledKeys = {},
+    modifierDown = {},
+    releaseUntil = {},
+    releasingCode = nil,
     caret = 0,
+    selectionAnchor = nil,
+    textDragging = false,
+    textDragStartX = 0,
+    inputViewStart = {},
+    inputMetrics = {},
+    repeatCode = nil,
+    repeatAt = 0,
     keyPrev = {},
     draggingWindow = false,
     draggingResize = false,
@@ -4358,8 +4558,30 @@ function Gui:EndFrame()
     end
 end
 
+-- Clipping logico do conteudo rolavel. Drawing nao possui um ScrollingFrame
+-- nativo, entao durante o corpo da pagina limitamos primitivas e hitboxes ao
+-- viewport, como o INSui faz ao renderizar apenas a faixa visivel.
+function Gui:ClipIntersection(x, y, w, h)
+    local c = self.renderClip
+    if not c then return x, y, w, h end
+    local x1 = math.max(x, c.x)
+    local y1 = math.max(y, c.y)
+    local x2 = math.min(x + w, c.x + c.w)
+    local y2 = math.min(y + h, c.y + c.h)
+    if x2 <= x1 or y2 <= y1 then return nil end
+    return x1, y1, x2 - x1, y2 - y1
+end
+
+function Gui:IsPrimitiveVisible(x, y, w, h)
+    if not self.renderClip then return true end
+    return self:ClipIntersection(x, y, w, h) ~= nil
+end
+
 function Gui:Box(x, y, w, h, color, filled, z, corner)
     if w <= 0 or h <= 0 then return nil end
+    local cx, cy, cw, ch = self:ClipIntersection(x, y, w, h)
+    if not cx then return nil end
+    x, y, w, h = cx, cy, cw, ch
     local o = self:Acquire("Square")
     if not o then return nil end
     safeSet(o, "Position", Vector2.new(math.floor(x), math.floor(y)))
@@ -4373,6 +4595,9 @@ function Gui:Box(x, y, w, h, color, filled, z, corner)
 end
 
 function Gui:Line(x1, y1, x2, y2, color, thickness, z)
+    local minX, maxX = math.min(x1, x2), math.max(x1, x2)
+    local minY, maxY = math.min(y1, y2), math.max(y1, y2)
+    if not self:IsPrimitiveVisible(minX, minY, math.max(1, maxX - minX), math.max(1, maxY - minY)) then return nil end
     local o = self:Acquire("Line")
     if not o then return nil end
     safeSet(o, "From", Vector2.new(math.floor(x1), math.floor(y1)))
@@ -4384,6 +4609,7 @@ function Gui:Line(x1, y1, x2, y2, color, thickness, z)
 end
 
 function Gui:Circle(x, y, radius, color, filled, thickness, z)
+    if not self:IsPrimitiveVisible(x - radius, y - radius, radius * 2, radius * 2) then return nil end
     local o = self:Acquire("Circle")
     if not o then return nil end
     safeSet(o, "Position", Vector2.new(math.floor(x), math.floor(y)))
@@ -4397,6 +4623,9 @@ function Gui:Circle(x, y, radius, color, filled, thickness, z)
 end
 
 function Gui:Triangle(ax, ay, bx, by, cx, cy, color, filled, z)
+    local minX, maxX = math.min(ax, bx, cx), math.max(ax, bx, cx)
+    local minY, maxY = math.min(ay, by, cy), math.max(ay, by, cy)
+    if not self:IsPrimitiveVisible(minX, minY, math.max(1, maxX - minX), math.max(1, maxY - minY)) then return nil end
     local o = self:Acquire("Triangle")
     if not o then return nil end
     safeSet(o, "PointA", Vector2.new(ax, ay))
@@ -4409,6 +4638,10 @@ function Gui:Triangle(ax, ay, bx, by, cx, cy, color, filled, z)
 end
 
 function Gui:Text(text, x, y, color, size, center, bold, z)
+    local textSize = size or 13
+    local approxW = math.max(2, #tostring(text or "") * textSize * 0.62)
+    local left = center == true and (x - approxW * 0.5) or x
+    if not self:IsPrimitiveVisible(left, y - 2, approxW, textSize + 6) then return nil end
     local o = self:Acquire("Text")
     if not o then return nil end
     safeSet(o, "Text", tostring(text or ""))
@@ -4426,6 +4659,7 @@ end
 
 function Gui:Image(data, x, y, w, h, z)
     if type(data) ~= "string" or data == "" then return nil end
+    if not self:IsPrimitiveVisible(x, y, w, h) then return nil end
     local o = self:Acquire("Image")
     if not o then return nil end
     safeSet(o, "Position", Vector2.new(math.floor(x), math.floor(y)))
@@ -4464,8 +4698,10 @@ end
 
 function Gui:Register(id, x, y, w, h, callback, priority)
     if w <= 0 or h <= 0 then return end
+    local cx, cy, cw, ch = self:ClipIntersection(x, y, w, h)
+    if not cx then return end
     self.hitboxes[#self.hitboxes + 1] = {
-        id = id, x = x, y = y, w = w, h = h,
+        id = id, x = cx, y = cy, w = cw, h = ch,
         callback = callback, priority = priority or 0,
     }
 end
@@ -4548,7 +4784,7 @@ function Gui:Cycle(id, label, options, x, y, w)
 end
 
 local VK = {
-    BACK = 0x08, RETURN = 0x0D, SHIFT = 0x10, ESC = 0x1B, DELETE = 0x2E,
+    BACK = 0x08, RETURN = 0x0D, SHIFT = 0x10, CTRL = 0x11, ALT = 0x12, ESC = 0x1B, DELETE = 0x2E,
     LEFT = 0x25, UP = 0x26, RIGHT = 0x27, DOWN = 0x28, HOME = 0x24, ENDKEY = 0x23,
     PGUP = 0x21, PGDN = 0x22, SPACE = 0x20,
 }
@@ -4562,7 +4798,7 @@ local VKCHARS = {
     [0x38] = {"8", "*"}, [0x39] = {"9", "("},
     [0xBD] = {"-", "_"}, [0xBB] = {"=", "+"}, [0xBC] = {",", "<"}, [0xBE] = {".", ">"},
     [0xBA] = {";", ":"}, [0xBF] = {"/", "?"}, [0xDB] = {"[", "{"}, [0xDD] = {"]", "}"},
-    [0xDE] = {"'", '"'},
+    [0xC0] = {"`", "~"}, [0xDC] = {"\\", "|"}, [0xDE] = {"'", '"'},
 }
 for i = 0, 25 do
     local lower = string.char(97 + i)
@@ -4573,24 +4809,250 @@ end
 local KEY_POLL = {VK.ESC, VK.RETURN, VK.BACK, VK.DELETE, VK.LEFT, VK.RIGHT, VK.HOME, VK.ENDKEY}
 for code = 0x30, 0x39 do KEY_POLL[#KEY_POLL + 1] = code end
 for code = 0x41, 0x5A do KEY_POLL[#KEY_POLL + 1] = code end
-for _, code in ipairs({0x20, 0xBD, 0xBB, 0xBC, 0xBE, 0xBA, 0xBF, 0xDB, 0xDD, 0xDE}) do
+for _, code in ipairs({0x20, 0xBD, 0xBB, 0xBC, 0xBE, 0xBA, 0xBF, 0xC0, 0xDB, 0xDC, 0xDD, 0xDE}) do
+    KEY_POLL[#KEY_POLL + 1] = code
+end
+for code = 0x60, 0x69 do
+    VKCHARS[code] = {tostring(code - 0x60), tostring(code - 0x60)}
     KEY_POLL[#KEY_POLL + 1] = code
 end
 
-function Gui:FocusInput(id)
-    self.activeInput = id
+local TEXT_INPUT_KEY = {}
+for _, code in ipairs(KEY_POLL) do TEXT_INPUT_KEY[code] = true end
+
+-- Variantes Win32 usadas depois da normalizacao do Enum.KeyCode.
+local INPUT_MODIFIER_KEY = {
+    [0x10] = true, [0xA0] = true, [0xA1] = true, -- Shift / LShift / RShift
+    [0x11] = true, [0xA2] = true, [0xA3] = true, -- Ctrl / LCtrl / RCtrl
+    [0x12] = true, [0xA4] = true, [0xA5] = true, -- Alt / LAlt / RAlt
+}
+
+-- UserInputService entrega o valor numerico de Enum.KeyCode (base SDL/Roblox),
+-- enquanto iskeypressed/keyrelease usam Virtual-Key Codes do Windows. Letras,
+-- pontuacao, navegacao e modificadores precisam ser traduzidos explicitamente.
+local ROBLOX_KEYCODE_TO_VK = {
+    [39] = 0xDE, [44] = 0xBC, [45] = 0xBD, [46] = 0xBE,
+    [47] = 0xBF, [59] = 0xBA, [61] = 0xBB, [91] = 0xDB,
+    [92] = 0xDC, [93] = 0xDD, [96] = 0xC0, [127] = VK.DELETE,
+    [266] = 0x6E, [267] = 0x6F, [268] = 0x6A, [269] = 0x6D,
+    [270] = 0x6B, [271] = VK.RETURN, [272] = 0xBB,
+    [273] = VK.UP, [274] = VK.DOWN, [275] = VK.RIGHT, [276] = VK.LEFT,
+    [277] = 0x2D, [278] = VK.HOME, [279] = VK.ENDKEY,
+    [280] = VK.PGUP, [281] = VK.PGDN,
+    [303] = 0xA1, [304] = 0xA0, [305] = 0xA3,
+    [306] = 0xA2, [307] = 0xA5, [308] = 0xA4,
+}
+for code = 97, 122 do ROBLOX_KEYCODE_TO_VK[code] = code - 32 end
+for code = 256, 265 do ROBLOX_KEYCODE_TO_VK[code] = 0x60 + (code - 256) end
+for code = 282, 293 do ROBLOX_KEYCODE_TO_VK[code] = 0x70 + (code - 282) end
+
+local function normalizeInputCode(code)
+    if type(code) ~= "number" then return nil end
+    return ROBLOX_KEYCODE_TO_VK[code] or code
+end
+
+local function isKeyboardVK(code)
+    return type(code) == "number" and code >= 0x08 and code <= 0xFE
+end
+
+-- A UI usa Drawing, portanto nao existe um TextBox Roblox capaz de marcar o
+-- input como processado. Nesta build do Matcha, setrobloxinput e a unica
+-- barreira geral disponivel antes de o teclado chegar ao jogo. Reaplicamos o
+-- estado enquanto houver foco porque outros scripts tambem podem mudar a flag.
+function Gui:SetRobloxInputBlocked(blocked, force)
+    blocked = blocked == true
+    if not force and self.robloxInputBlocked == blocked then
+        return true
+    end
+
+    local ok = false
+    if type(setrobloxinput) == "function" then
+        ok = pcall(function()
+            -- A API recebe se o input deve ser encaminhado ao Roblox.
+            setrobloxinput(not blocked)
+        end)
+    end
+
+    if ok then
+        self.robloxInputBlocked = blocked
+    else
+        -- O shutdown nunca deve deixar o estado interno preso em "bloqueado".
+        self.robloxInputBlocked = false
+    end
+    return ok
+end
+
+-- Mesmo modelo do INSui: Drawing nao consome o mouse/teclado por si so.
+-- Bloqueia o Roblox enquanto o usuario digita OU enquanto o cursor esta sobre
+-- a janela do Guider, inclusive minimizada/arrastando. Fora da UI e sem foco,
+-- o jogo volta a receber input normalmente.
+function Gui:ShouldBlockRobloxInput()
+    if not self.running or not self.visible then return false end
+    if self.activeInput then return true end
+    if self.draggingWindow or self.draggingResize or self.draggingResultScroll or self.draggingPageScroll
+        or self.pageContentDrag or self.draggingOverlayScroll then
+        return true
+    end
+
+    local mx, my = Mouse.X or 0, Mouse.Y or 0
+    local wx, wy = self.window.x, self.window.y
+    local ww = self.minimized and self.minimizedWidth or self.window.width
+    local wh = self.minimized and self.minimizedHeight or self.window.height
+    return inRect(mx, my, wx, wy, ww, wh)
+end
+
+function Gui:UpdateRobloxInputCapture(force)
+    local shouldBlock = self:ShouldBlockRobloxInput()
+    -- Enquanto bloqueado, reaplica false continuamente. Isso evita que outra UI
+    -- ou o proprio ambiente reative o encaminhamento no meio da digitacao.
+    return self:SetRobloxInputBlocked(shouldBlock, shouldBlock or force == true)
+end
+
+-- O teclado nao usa callbacks de InputBegan/InputEnded para editar texto.
+-- Isso e intencional: o INSui trabalha por polling e evita eventos duplicados.
+
+-- Modelo de edicao inspirado no INSui: clique posiciona o caret, arraste seleciona,
+-- Shift amplia selecao e Ctrl+A/C/X/V funcionam sem depender de TextBox Roblox.
+local NUMERIC_INPUT_IDS = {
+    utmm_level = true, utmm_resets = true, utmm_tr = true,
+    utmm_reset_min = true, utmm_reset_max = true,
+    utmm_tr_min = true, utmm_tr_max = true,
+}
+
+local function inputCharAllowed(id, char)
+    if char == "\r" or char == "\n" or char == "\t" then return false end
+    if not NUMERIC_INPUT_IDS[id] then return true end
+    -- Mantem suporte aos sufixos ja aceitos pelos parsers do Guider (K/M/B/T/Qa...).
+    return string.match(char, "[%d%a%.,]") ~= nil
+end
+
+local function ctrlHeld()
+    local held = false
+    if type(iskeypressed) == "function" then
+        pcall(function()
+            held = iskeypressed(VK.CTRL) == true
+                or iskeypressed(0xA2) == true or iskeypressed(0xA3) == true
+        end)
+    end
+    return held
+end
+
+local function shiftHeld(gui)
+    local held = gui.modifierDown[VK.SHIFT] == true
+        or gui.modifierDown[0xA0] == true or gui.modifierDown[0xA1] == true
+    if not held and type(iskeypressed) == "function" then
+        pcall(function()
+            held = iskeypressed(VK.SHIFT) == true
+                or iskeypressed(0xA0) == true or iskeypressed(0xA1) == true
+        end)
+    end
+    return held
+end
+
+function Gui:SelectionRange(value)
+    local anchor = self.selectionAnchor
+    local caret = clamp(self.caret or #value, 0, #value)
+    if anchor == nil or anchor == caret then return nil, nil end
+    return math.min(anchor, caret), math.max(anchor, caret)
+end
+
+function Gui:DeleteSelection(id, value)
+    local a, b = self:SelectionRange(value)
+    if not a then return value, false end
+    value = string.sub(value, 1, a) .. string.sub(value, b + 1)
+    self.caret = a
+    self.selectionAnchor = nil
+    uiCache[id] = value
+    return value, true
+end
+
+function Gui:MouseToInputCaret(id, mouseX)
+    local m = self.inputMetrics[id]
     local value = tostring(widgetValue(id) or "")
-    self.caret = #value
-    self.keyPrev = {}
+    if not m then return #value end
+    local charW = m.charW or 7
+    local startIndex = m.startIndex or 1
+    local localIndex = math.floor(((mouseX or m.textX) - m.textX) / charW + 0.5)
+    return clamp((startIndex - 1) + localIndex, 0, #value)
+end
+
+function Gui:SetCaretFromMouse(id, mouseX, beginSelection)
+    local caret = self:MouseToInputCaret(id, mouseX)
+    if beginSelection then
+        self.selectionAnchor = self.caret or caret
+    else
+        self.selectionAnchor = nil
+    end
+    self.caret = caret
     self.dirty = true
 end
 
-function Gui:BlurInput(save)
+function Gui:FocusInput(id, mouseX)
+    local switchingInput = self.activeInput ~= nil and self.activeInput ~= id
+    local alreadyFocused = self.activeInput == id
+    self.activeInput = id
+    local value = tostring(widgetValue(id) or "")
+
+    if mouseX ~= nil then
+        local caret = self:MouseToInputCaret(id, mouseX)
+        local shift = shiftHeld(self)
+        if shift and alreadyFocused then
+            self.selectionAnchor = self.selectionAnchor or self.caret or caret
+        else
+            self.selectionAnchor = caret
+        end
+        self.caret = caret
+        self.textDragging = true
+        self.textDragStartX = mouseX
+    elseif not alreadyFocused then
+        self.caret = #value
+        self.selectionAnchor = nil
+    end
+
+    -- Ao clicar diretamente em outro Input, o foco nunca deixa a UI. Mantem o
+    -- estado das teclas ja suprimidas para que uma tecla fisicamente segurada
+    -- nao seja esquecida nem restaurada para o jogo entre os dois campos.
+    if not switchingInput and not alreadyFocused then
+        self.keyPrev = {}
+        self.pendingTextKeys = {}
+        self.focusedKeys = {}
+        self.polledKeys = {}
+        self.modifierDown = {}
+        self.releaseUntil = {}
+        self.releasingCode = nil
+        self.repeatCode = nil
+        self.repeatAt = 0
+    end
+    -- Bloqueia ANTES do proximo key-down e mantem a UI lendo o teclado bruto via
+    -- iskeypressed/InputBegan. O bloqueio e global: letras, numeros, Space,
+    -- simbolos e teclas de edicao nao precisam de uma blacklist individual.
+    self:SetRobloxInputBlocked(true, true)
+    self.dirty = true
+end
+
+function Gui:BlurInput(save, doNotRestoreCode)
     if self.activeInput and save ~= false and self.activeInput ~= "utmm_search" then
         saveConfig()
     end
     self.activeInput = nil
+    self.selectionAnchor = nil
+    self.textDragging = false
+    self.repeatCode = nil
+    self.repeatAt = 0
     self.keyPrev = {}
+    self.pendingTextKeys = {}
+    self.focusedKeys = {}
+    self.polledKeys = {}
+    self.modifierDown = {}
+    self.releaseUntil = {}
+    self.releasingCode = nil
+    -- Restauracao incondicional e imediata ao clicar fora, trocar de pagina,
+    -- minimizar, pressionar Enter/Esc, fechar ou reexecutar o Guider.
+    self:SetRobloxInputBlocked(false, true)
+
+    -- Nao injeta keypress/keyrelease ao sair do campo. Como o input do Roblox
+    -- ficou desabilitado durante o foco, reenviar uma tecla aqui causaria
+    -- exatamente o vazamento/acao duplicada que queremos evitar.
     self.dirty = true
 end
 
@@ -4605,52 +5067,153 @@ function Gui:SubmitSearch()
     self:QueueJob(2, function() searchBoss(q) end, true)
 end
 
-function Gui:PollTextInput()
+function Gui:ApplyTextKey(code)
     local id = self.activeInput
-    if not id then return end
+    if not id then return false end
     local value = tostring(widgetValue(id) or "")
-    local shift = type(iskeypressed) == "function" and iskeypressed(VK.SHIFT) or false
+    self.caret = clamp(self.caret or #value, 0, #value)
+    local shift = shiftHeld(self)
+    local ctrl = ctrlHeld()
 
-    for _, code in ipairs(KEY_POLL) do
-        local down = type(iskeypressed) == "function" and iskeypressed(code) or false
-        local prev = self.keyPrev[code] == true
-        if down and not prev then
-            if code == VK.ESC then
-                self:BlurInput(true)
-                return
-            elseif code == VK.RETURN then
-                if id == "utmm_search" then self:SubmitSearch() end
-                self:BlurInput(true)
-                return
-            elseif code == VK.LEFT then
-                self.caret = math.max(0, self.caret - 1)
-            elseif code == VK.RIGHT then
-                self.caret = math.min(#value, self.caret + 1)
-            elseif code == VK.HOME then
-                self.caret = 0
-            elseif code == VK.ENDKEY then
-                self.caret = #value
-            elseif code == VK.BACK then
-                if self.caret > 0 then
-                    value = string.sub(value, 1, self.caret - 1) .. string.sub(value, self.caret + 1)
-                    self.caret = self.caret - 1
-                    uiCache[id] = value
+    if code == VK.ESC then
+        self:BlurInput(true, VK.ESC)
+        return false
+    elseif code == VK.RETURN then
+        if id == "utmm_search" then self:SubmitSearch() end
+        self:BlurInput(true, VK.RETURN)
+        return false
+    end
+
+    -- Atalhos de edicao no mesmo estilo do INSui.
+    if ctrl then
+        if code == VK.A then
+            self.selectionAnchor = 0
+            self.caret = #value
+            self.dirty = true
+            return true
+        elseif code == VK.C or code == VK.X then
+            local a, b = self:SelectionRange(value)
+            if a and type(setclipboard) == "function" then
+                pcall(function() setclipboard(string.sub(value, a + 1, b)) end)
+            end
+            if code == VK.X and a then
+                value = string.sub(value, 1, a) .. string.sub(value, b + 1)
+                self.caret = a
+                self.selectionAnchor = nil
+                uiCache[id] = value
+            end
+            self.dirty = true
+            return true
+        elseif code == VK.V then
+            local clip = nil
+            if type(getclipboard) == "function" then
+                pcall(function() clip = getclipboard() end)
+            end
+            if type(clip) == "string" and clip ~= "" then
+                local filtered = ""
+                for i = 1, #clip do
+                    local ch = string.sub(clip, i, i)
+                    if inputCharAllowed(id, ch) then filtered = filtered .. ch end
                 end
-            elseif code == VK.DELETE then
-                if self.caret < #value then
-                    value = string.sub(value, 1, self.caret) .. string.sub(value, self.caret + 2)
-                    uiCache[id] = value
-                end
-            else
-                local pair = VKCHARS[code]
-                if pair then
-                    local char = pair[shift and 2 or 1]
-                    value = string.sub(value, 1, self.caret) .. char .. string.sub(value, self.caret + 1)
-                    self.caret = self.caret + #char
+                if filtered ~= "" then
+                    value = self:DeleteSelection(id, value)
+                    local before = string.sub(value, 1, self.caret)
+                    local after = string.sub(value, self.caret + 1)
+                    value = before .. filtered .. after
+                    self.caret = self.caret + #filtered
+                    self.selectionAnchor = nil
                     uiCache[id] = value
                 end
             end
             self.dirty = true
+            return true
+        end
+    end
+
+    if code == VK.LEFT or code == VK.RIGHT or code == VK.HOME or code == VK.ENDKEY then
+        local a, b = self:SelectionRange(value)
+        local nextCaret = self.caret
+        if code == VK.LEFT then
+            nextCaret = (a and not shift) and a or math.max(0, self.caret - 1)
+        elseif code == VK.RIGHT then
+            nextCaret = (b and not shift) and b or math.min(#value, self.caret + 1)
+        elseif code == VK.HOME then
+            nextCaret = 0
+        elseif code == VK.ENDKEY then
+            nextCaret = #value
+        end
+        if shift then
+            self.selectionAnchor = self.selectionAnchor or self.caret
+        else
+            self.selectionAnchor = nil
+        end
+        self.caret = nextCaret
+    elseif code == VK.BACK then
+        local deleted
+        value, deleted = self:DeleteSelection(id, value)
+        if not deleted and self.caret > 0 then
+            value = string.sub(value, 1, self.caret - 1) .. string.sub(value, self.caret + 1)
+            self.caret = self.caret - 1
+            uiCache[id] = value
+        end
+    elseif code == VK.DELETE then
+        local deleted
+        value, deleted = self:DeleteSelection(id, value)
+        if not deleted and self.caret < #value then
+            value = string.sub(value, 1, self.caret) .. string.sub(value, self.caret + 2)
+            uiCache[id] = value
+        end
+    else
+        local pair = VKCHARS[code]
+        if pair then
+            local char = pair[shift and 2 or 1]
+            if inputCharAllowed(id, char) then
+                value = self:DeleteSelection(id, value)
+                value = string.sub(value, 1, self.caret) .. char .. string.sub(value, self.caret + 1)
+                self.caret = self.caret + #char
+                self.selectionAnchor = nil
+                uiCache[id] = value
+            end
+        end
+    end
+    self.dirty = true
+    return self.activeInput ~= nil
+end
+
+function Gui:PollTextInput()
+    if not self.activeInput then return end
+
+    -- Repeticao de tecla no estilo de um TextBox real: atraso inicial e depois
+    -- repeticao curta para Backspace/Delete/setas e caracteres.
+    if self.repeatCode and type(iskeypressed) == "function" then
+        local held = false
+        pcall(function() held = iskeypressed(self.repeatCode) == true end)
+        if held and tick() >= (self.repeatAt or 0) then
+            self.repeatAt = tick() + 0.035
+            if not self:ApplyTextKey(self.repeatCode) then return end
+        elseif not held then
+            self.repeatCode = nil
+            self.repeatAt = 0
+        end
+    end
+
+    -- Fonte unica de digitacao: somente iskeypressed(). Nada e enfileirado por
+    -- InputBegan, portanto cada transicao UP -> DOWN aplica a tecla exatamente 1x.
+    for _, code in ipairs(KEY_POLL) do
+        local down = false
+        if type(iskeypressed) == "function" then
+            pcall(function() down = iskeypressed(code) == true end)
+        end
+        local prev = self.keyPrev[code] == true
+        if down and not prev then
+            self.focusedKeys[code] = true
+            if not self:ApplyTextKey(code) then return end
+            if self.activeInput and (code == VK.BACK or code == VK.DELETE or code == VK.LEFT or code == VK.RIGHT or TEXT_INPUT_KEY[code]) then
+                self.repeatCode = code
+                self.repeatAt = tick() + 0.4
+            end
+        elseif not down then
+            self.focusedKeys[code] = nil
         end
         self.keyPrev[code] = down
     end
@@ -4659,27 +5222,71 @@ end
 function Gui:Input(id, label, placeholder, x, y, w)
     local value = tostring(widgetValue(id) or "")
     local focused = self.activeInput == id
+    local hovered = self.hovered == ("input:" .. id)
     self:Text(label, x, y, Theme.textMuted, 11, false, false, 5)
     local by = y + 16
+
+    -- Visual inspirado no textbox do INSui: fill sutil e borda que reage a hover/foco.
     self:Box(x, by, w, 29, Theme.panel2, true, 5, 6)
-    self:Box(x, by, w, 29, focused and Theme.accent or Theme.border, false, 6, 6)
+    local border = focused and Theme.accent or (hovered and Theme.textMuted or Theme.border)
+    self:Box(x, by, w, 29, border, false, 6, 6)
+
+    local charW = 7
+    local textX = x + 8
+    local maxChars = math.max(1, math.floor((w - 16) / charW))
+    self.caret = focused and clamp(self.caret or #value, 0, #value) or self.caret
+
+    local startIndex = self.inputViewStart[id] or 1
+    if focused then
+        local caretIndex = self.caret + 1
+        if caretIndex < startIndex then startIndex = caretIndex end
+        if caretIndex > startIndex + maxChars then startIndex = caretIndex - maxChars end
+        startIndex = clamp(startIndex, 1, math.max(1, #value + 1))
+        self.inputViewStart[id] = startIndex
+    else
+        startIndex = 1
+        if #value > maxChars then startIndex = #value - maxChars + 1 end
+    end
+
+    self.inputMetrics[id] = {
+        x = x, y = by, w = w, h = 29,
+        textX = textX, charW = charW,
+        startIndex = startIndex, maxChars = maxChars,
+    }
 
     local shown = value
-    if shown == "" and not focused then shown = placeholder or "" end
-    local maxChars = math.max(6, math.floor((w - 18) / 7))
-    local startIndex = 1
-    if #shown > maxChars then startIndex = #shown - maxChars + 1 end
-    local visible = string.sub(shown, startIndex)
-    self:Text(visible, x + 8, by + 7, (value == "" and not focused) and Theme.textMuted or Theme.text, 12, false, false, 7)
+    local placeholderShown = false
+    if shown == "" and not focused then
+        shown = placeholder or ""
+        placeholderShown = true
+        startIndex = 1
+    end
+    local visible = string.sub(shown, startIndex, startIndex + maxChars - 1)
+
+    -- Destaque da selecao antes do texto, como no INSui.
+    if focused and not placeholderShown then
+        local a, b = self:SelectionRange(value)
+        if a then
+            local visA = clamp(a - (startIndex - 1), 0, maxChars)
+            local visB = clamp(b - (startIndex - 1), 0, maxChars)
+            if visB > visA then
+                self:Box(textX + visA * charW, by + 6, math.max(1, (visB - visA) * charW), 17, Theme.accentSoft, true, 6, 2)
+            end
+        end
+    end
+
+    self:Text(visible, textX, by + 7, placeholderShown and Theme.textMuted or Theme.text, 12, false, false, 7)
 
     if focused and math.floor(tick() * 2) % 2 == 0 then
         local caretVisible = self.caret - (startIndex - 1)
-        caretVisible = clamp(caretVisible, 0, #visible)
-        local cx = x + 8 + caretVisible * 7
+        caretVisible = clamp(caretVisible, 0, maxChars)
+        local cx = textX + caretVisible * charW
         self:Line(cx, by + 6, cx, by + 22, Theme.accent, 1, 8)
     end
 
-    self:Register("input:" .. id, x, by, w, 29, function() self:FocusInput(id) end, 9)
+    self:Register("input:" .. id, x, by, w, 29, function()
+        self:FocusInput(id, Mouse.X or x)
+    end, 9)
     return by + 29
 end
 
@@ -4784,21 +5391,32 @@ function Gui:CapturePage(page)
     self.dirty = true
 end
 
-local pendingJobPage = nil
-
 requestJob = function(fn)
     if type(fn) ~= "function" then return end
+    state.requestId = state.requestId + 1
+    local id = state.requestId
+    local page = Gui.selectedPage
+
+    -- Se um pedido ainda nem comecou, substitui-o e libera o indicador da
+    -- pagina antiga. Um pedido em execucao sera cancelado no proximo checkpoint.
+    if pendingJob and Gui.pageRequestId[pendingJob.page] == pendingJob.id then
+        Gui.pageBusy[pendingJob.page] = false
+    end
     state.busy = true
     state.messageKey = nil
-    pendingJob = fn
-    pendingJobPage = Gui.selectedPage
-    Gui.pageBusy[pendingJobPage] = true
+    pendingJob = { fn = fn, page = page, id = id }
+    Gui.pageRequestId[page] = id
+    Gui.pageBusy[page] = true
     Gui.dirty = true
 end
 
 function Gui:QueueJob(page, fn, resetScroll)
     self.selectedPage = page or self.selectedPage
-    if resetScroll then self.resultScroll[self.selectedPage] = 0 end
+    if resetScroll then
+        self.pageScroll[self.selectedPage] = 0
+        self.pageTargetScroll[self.selectedPage] = 0
+        self.pageVelocity[self.selectedPage] = 0
+    end
     requestJob(fn)
 end
 
@@ -4852,7 +5470,10 @@ function Gui:DrawSidebar(wx, wy, ww, wh)
         self:Register(id, wx + 8, y, sw - 16, 34, function()
             self:BlurInput(true)
             self.overlay = nil
+            self.draggingPageScroll = false
+            self.pageContentDrag = nil
             self.selectedPage = page
+            self.pageTargetScroll[page] = clamp(self.pageTargetScroll[page] or 0, 0, self.pageScrollMax[page] or 0)
             self.dirty = true
         end, 8)
         y = y + 39
@@ -4895,8 +5516,11 @@ function Gui:DrawHeader(wx, wy, ww)
         self.minimized = true
         self.draggingResize = false
         self.draggingResultScroll = false
+        self.draggingPageScroll = false
+        self.pageContentDrag = nil
         self.draggingOverlayScroll = false
         self.resultMetrics = nil
+        self.pageMetrics = nil
         self.overlayMetrics = nil
         self.dirty = true
     end, 20)
@@ -4954,33 +5578,55 @@ function Gui:DrawPageControls(cx, cy, cw)
         y = y + 35
 
     elseif page == 2 then
-        local inputW = cw - 104
+        -- Um unico botao de busca. O campo aproveita o espaco que antes era
+        -- ocupado pelo segundo botao "SEARCH" duplicado.
+        local searchButtonW = 40
+        local searchGap = 8
+        local inputW = cw - searchButtonW - searchGap
         self:Input("utmm_search", Lang.Search, Lang.SearchPlaceholder, cx, y, inputW)
-        self:Button("search", "", cx + inputW + 8, y + 16, 40, 29, function() self:SubmitSearch() end, true, 6)
-        self:DrawIcon("searchbutton", cx + inputW + 19, y + 22, Theme.text, 9)
-        self:Button("search_text", Lang.SearchBtn, cx + inputW + 54, y + 16, 50, 29, function() self:SubmitSearch() end, false, 6)
+        self:Button("search", "", cx + inputW + searchGap, y + 16, searchButtonW, 29, function() self:SubmitSearch() end, true, 6)
+        self:DrawIcon("searchbutton", cx + inputW + searchGap + 11, y + 22, Theme.text, 9)
         y = y + 53
-        self:Toggle("utmm_utmoh", Lang.UTMOHMaterials, cx, y, math.floor(cw * 0.50))
+
+        -- Toggle fica logo depois do texto, em vez de ser empurrado para metade
+        -- da largura do painel.
+        local utmohW = math.min(cw, math.max(150, #tostring(Lang.UTMOHMaterials or "") * 7 + 48))
+        self:Toggle("utmm_utmoh", Lang.UTMOHMaterials, cx, y, utmohW)
         y = y + 29
 
     elseif page == 3 then
+        -- Bloco principal da Progressao: rota + gerenciadores de blacklist.
+        -- "What's Missing" e uma ferramenta diferente e fica em uma secao
+        -- propria abaixo, em vez de disputar a mesma linha do Generate Route.
         self:Text(Lang.ProgressDesc, cx, y, Theme.textDim, 11, false, false, 5)
         y = y + 22
         self:Button("progress:route", Lang.GenRoute, cx, y, 145, 29, function()
             self:QueueJob(3, function() generateProgressRoute() end, true)
         end, true, 6)
-        self:Button("progress:missing", Lang.MissingBtn, cx + 153, y, 145, 29, function()
-            self:QueueJob(3, function() findMissingItems() end, true)
-        end, false, 6)
-        self:Toggle("utmm_missing_all", Lang.MissingAll, cx + 310, y + 3, cw - 310)
         y = y + 37
-        self:Button("manage:progress", Lang.BlacklistTitle .. " (" .. #state.progressBlacklistOrder .. ")", cx, y, math.floor((cw - 8) * 0.5), 27, function()
+
+        local half = math.floor((cw - 8) * 0.5)
+        self:Button("manage:progress", Lang.BlacklistTitle .. " (" .. #state.progressBlacklistOrder .. ")", cx, y, half, 27, function()
             self:OpenManager("progress")
         end, false, 6)
-        self:Button("manage:missing", Lang.MissBlacklistTitle .. " (" .. #missingBlacklistOrder .. ")", cx + math.floor((cw - 8) * 0.5) + 8, y, math.floor((cw - 8) * 0.5), 27, function()
+        self:Button("manage:missing", Lang.MissBlacklistTitle .. " (" .. #missingBlacklistOrder .. ")", cx + half + 8, y, half, 27, function()
             self:OpenManager("missing")
         end, false, 6)
-        y = y + 35
+        y = y + 41
+
+        -- Separador visual: Missing Items e uma acao independente da rota e
+        -- dos botoes de gerenciamento acima.
+        self:Line(cx, y, cx + cw, y, Theme.border, 1, 4)
+        y = y + 12
+        self:Text(Lang.MissingDesc, cx, y, Theme.textDim, 11, false, false, 5)
+        y = y + 20
+
+        self:Button("progress:missing", Lang.MissingBtn, cx, y, 145, 29, function()
+            self:QueueJob(3, function() findMissingItems() end, true)
+        end, false, 6)
+        self:Toggle("utmm_missing_all", Lang.MissingAll, cx + 157, y + 3, math.max(0, cw - 157))
+        y = y + 37
+
         if state.fragDiag and state.fragDiag ~= "" then
             self:Text(state.fragDiag, cx, y, Theme.textMuted, 10, false, false, 5)
             y = y + 17
@@ -5048,6 +5694,9 @@ local function visibleIntersection(y, h, top, bottom)
 end
 
 function Gui:ResultEntryHeight(e)
+    if e.renderHeight and e.renderHeightLang == CurrentLanguage then
+        return e.renderHeight
+    end
     local lines = entryLines(e)
     local h = 34 + #lines * 15 + 12
     local actionCount = 0
@@ -5057,6 +5706,8 @@ function Gui:ResultEntryHeight(e)
     if e.shopTargets and #e.shopTargets > 0 and e.shopName then
         h = h + #e.shopTargets * 42
     end
+    e.renderHeight = h
+    e.renderHeightLang = CurrentLanguage
     return h
 end
 
@@ -5160,19 +5811,22 @@ function Gui:DrawResultCard(e, displayIndex, x, y, w, top, bottom)
 end
 
 function Gui:ScrollResults(delta)
+    -- Nome legado mantido para compatibilidade interna. O deslocamento agora e
+    -- da PAGINA inteira, como no INSui, e nao de uma sublista isolada.
     local page = self.selectedPage
-    local maxScroll = self.resultScrollMax[page] or 0
-    local current = self.resultScroll[page] or 0
+    local maxScroll = self.pageScrollMax[page] or 0
+    local current = self.pageTargetScroll[page] or self.pageScroll[page] or 0
     local nextValue = clamp(current + delta, 0, maxScroll)
     if nextValue ~= current then
-        self.resultScroll[page] = nextValue
+        self.pageTargetScroll[page] = nextValue
+        self.pageVelocity[page] = 0
         self.dirty = true
         return true
     end
     return false
 end
 
-function Gui:DrawResults(cx, cy, cw, bottomY)
+function Gui:DrawResults(cx, cy, cw, clipTop, clipBottom)
     local page = self.selectedPage
     local snap = self:PageSnapshot(page)
     local status = self:StatusFor(page, snap)
@@ -5180,65 +5834,129 @@ function Gui:DrawResults(cx, cy, cw, bottomY)
     self:Text(status, cx + 2, cy + 4, self.pageBusy[page] and Theme.warning or Theme.textDim, 11, false, true, 5)
 
     local viewTop = cy + headerH
-    local viewBottom = bottomY
-    local viewH = math.max(80, viewBottom - viewTop)
-    self:Box(cx, viewTop, cw, viewH, Theme.bg, true, 3, 7)
-    self:Box(cx, viewTop, cw, viewH, Theme.borderSoft, false, 4, 7)
-
     local entries = snap.results or {}
     local contentH = 10
     if snap.warning and snap.warning ~= "" then contentH = contentH + 32 end
     for i = 1, #entries do contentH = contentH + self:ResultEntryHeight(entries[i]) + 8 end
     if snap.overflow and snap.overflow > 0 then contentH = contentH + 24 end
-    local maxScroll = math.max(0, contentH - viewH)
-    self.resultScrollMax[page] = maxScroll
-    self.resultScroll[page] = clamp(self.resultScroll[page] or 0, 0, maxScroll)
+    contentH = math.max(54, contentH)
+    local naturalBottom = viewTop + contentH
 
-    local scroll = self.resultScroll[page] or 0
-    local y = viewTop + 10 - scroll
-    local cardW = cw - (maxScroll > 0 and 17 or 8)
+    local iy, ih = visibleIntersection(viewTop, contentH, clipTop, clipBottom)
+    if iy then
+        self:Box(cx, iy, cw, ih, Theme.bg, true, 3, 7)
+        self:Box(cx, iy, cw, ih, Theme.borderSoft, false, 4, 7)
+    end
+
+    local y = viewTop + 10
+    local cardW = cw - 8
 
     if snap.warning and snap.warning ~= "" then
-        if y + 20 >= viewTop and y <= viewBottom then
+        if y + 20 >= clipTop and y <= clipBottom then
             self:Text(string.sub(snap.warning, 1, 92), cx + 10, y + 3, Theme.warning, 10, false, false, 7)
         end
         y = y + 32
     end
 
     if #entries == 0 and not self.pageBusy[page] then
-        self:Text("-", cx + 12, viewTop + 13, Theme.textMuted, 12, false, false, 6)
+        if viewTop + 13 >= clipTop and viewTop + 13 <= clipBottom then
+            self:Text("-", cx + 12, viewTop + 13, Theme.textMuted, 12, false, false, 6)
+        end
     end
 
     for i = 1, #entries do
         local e = entries[i]
         local displayIndex = e.stepIndex or i
-        local h = self:DrawResultCard(e, displayIndex, cx + 7, y, cardW - 7, viewTop + 2, viewBottom - 2)
+        local h = self:DrawResultCard(e, displayIndex, cx + 7, y, cardW - 7, clipTop + 1, clipBottom - 1)
         y = y + h + 8
     end
 
-    if snap.overflow and snap.overflow > 0 and y >= viewTop and y <= viewBottom - 15 then
+    if snap.overflow and snap.overflow > 0 and y >= clipTop and y <= clipBottom - 15 then
         self:Text("... +" .. tostring(snap.overflow), cx + 12, y, Theme.textMuted, 10, false, false, 6)
     end
 
-    if maxScroll > 0 then
-        local trackX = cx + cw - 9
-        local trackY = viewTop + 5
-        local trackH = viewH - 10
-        self:Box(trackX, trackY, 4, trackH, Theme.panel2, true, 6, 2)
-        local thumbH = math.max(28, math.floor((viewH / contentH) * trackH))
-        local travel = math.max(1, trackH - thumbH)
-        local thumbY = trackY + math.floor((scroll / maxScroll) * travel)
-        self:Box(trackX, thumbY, 4, thumbH, self.hovered == "result_scroll" and Theme.accent or Theme.border, true, 8, 2)
-        self:Register("result_scroll", trackX - 5, thumbY, 14, thumbH, function()
-            self.draggingResultScroll = true
-            self.scrollGrab = Mouse.Y - thumbY
-        end, 14)
-        self.resultMetrics = {
-            x = cx, y = viewTop, w = cw, h = viewH,
-            trackY = trackY, trackH = trackH, thumbH = thumbH,
-        }
+    self.resultMetrics = nil
+    return naturalBottom
+end
+
+function Gui:DrawPageScrollbar(cx, viewportTop, cw, viewportH)
+    local page = self.selectedPage
+    local maxScroll = self.pageScrollMax[page] or 0
+    self.pageMetrics = {
+        x = cx, y = viewportTop, w = cw, h = viewportH,
+        maxScroll = maxScroll,
+    }
+    if maxScroll <= 0 then return end
+
+    local scroll = clamp(self.pageScroll[page] or 0, 0, maxScroll)
+    local totalH = viewportH + maxScroll
+    local trackX = cx + cw + 5
+    local trackY = viewportTop + 4
+    local trackH = math.max(20, viewportH - 8)
+    local thumbH = math.max(34, math.floor((viewportH / math.max(viewportH, totalH)) * trackH))
+    thumbH = math.min(trackH, thumbH)
+    local travel = math.max(1, trackH - thumbH)
+    local ratio = maxScroll > 0 and (scroll / maxScroll) or 0
+    local thumbY = trackY + ratio * travel
+    local hover = self.hovered == "page_scroll" or self.draggingPageScroll
+
+    self:Box(trackX, trackY, 3, trackH, Theme.panel2, true, 10, 2)
+    self:Box(trackX - (hover and 1 or 0), thumbY, hover and 5 or 4, thumbH,
+        hover and Theme.accent or Theme.border, true, 12, 3)
+
+    self.pageMetrics.trackX = trackX
+    self.pageMetrics.trackY = trackY
+    self.pageMetrics.trackH = trackH
+    self.pageMetrics.thumbY = thumbY
+    self.pageMetrics.thumbH = thumbH
+
+    self:Register("page_scroll", trackX - 7, trackY, 18, trackH, function()
+        local my = Mouse.Y or thumbY
+        self.draggingPageScroll = true
+        self.pageVelocity[page] = 0
+        if my >= thumbY and my <= thumbY + thumbH then
+            self.pageScrollGrab = my - thumbY
+        else
+            self.pageScrollGrab = thumbH * 0.5
+            local r = clamp((my - trackY - self.pageScrollGrab) / travel, 0, 1)
+            self.pageTargetScroll[page] = r * maxScroll
+        end
+        self.dirty = true
+    end, 18)
+end
+
+function Gui:StepPageScroll(dt)
+    dt = tonumber(dt) or (1 / 60)
+    if dt <= 0 or dt > 0.25 then dt = 1 / 60 end
+    self.lastDt = dt
+
+    local page = self.selectedPage
+    local maxScroll = self.pageScrollMax[page] or 0
+    local target = clamp(self.pageTargetScroll[page] or self.pageScroll[page] or 0, 0, maxScroll)
+
+    -- Inercia do arraste do conteudo, seguindo o comportamento do INSui.
+    if not self.draggingPageScroll and not self.pageContentDrag then
+        local velocity = self.pageVelocity[page] or 0
+        if math.abs(velocity) >= 4 then
+            target = clamp(target + velocity * dt, 0, maxScroll)
+            velocity = velocity * math.exp(-5 * dt)
+            if target <= 0 or target >= maxScroll or math.abs(velocity) < 4 then velocity = 0 end
+            self.pageVelocity[page] = velocity
+        else
+            self.pageVelocity[page] = 0
+        end
+    end
+
+    self.pageTargetScroll[page] = target
+    local current = clamp(self.pageScroll[page] or target, 0, maxScroll)
+    local alpha = 1 - math.exp(-15 * dt)
+    local nextValue = current + (target - current) * alpha
+    if math.abs(nextValue - target) < 0.1 then nextValue = target end
+    if math.abs(nextValue - current) > 0.001 then
+        self.pageScroll[page] = nextValue
+        self.dirty = true
     else
-        self.resultMetrics = {x = cx, y = viewTop, w = cw, h = viewH}
+        self.pageScroll[page] = nextValue
     end
 end
 
@@ -5443,14 +6161,35 @@ function Gui:Render()
     self:DrawSidebar(wx, wy, ww, wh)
     self:DrawHeader(wx, wy, ww)
 
+    -- Uma unica viewport vertical para a pagina inteira, como no INSui.
     local cx = wx + self.window.sidebar + 16
-    local cw = ww - self.window.sidebar - 32
-    local cy = wy + self.window.header + 13
+    local cw = ww - self.window.sidebar - 38 -- reserva o gutter da scrollbar
+    local viewportTop = wy + self.window.header + 8
+    local viewportBottom = wy + wh - 18
+    local viewportH = math.max(80, viewportBottom - viewportTop)
+    local page = self.selectedPage
+    local scroll = clamp(self.pageScroll[page] or 0, 0, self.pageScrollMax[page] or 0)
+    local contentOrigin = viewportTop + 5 - scroll
+
+    self.renderClip = {x = cx - 2, y = viewportTop, w = cw + 4, h = viewportH}
+    local cy = contentOrigin
     cy = self:DrawStatInputs(cx, cy, cw) + 8
     cy = self:DrawPageControls(cx, cy, cw)
     cy = cy + 3
-    local bottomY = wy + wh - 18
-    self:DrawResults(cx, cy, cw, bottomY)
+    local contentBottom = self:DrawResults(cx, cy, cw, viewportTop, viewportBottom)
+    self.renderClip = nil
+
+    local contentHeight = math.max(0, contentBottom - contentOrigin + 8)
+    local maxScroll = math.max(0, contentHeight - viewportH)
+    self.pageScrollMax[page] = maxScroll
+    self.pageTargetScroll[page] = clamp(self.pageTargetScroll[page] or scroll, 0, maxScroll)
+    local needsFollowup = false
+    if (self.pageScroll[page] or 0) > maxScroll then
+        self.pageScroll[page] = maxScroll
+        needsFollowup = true
+    end
+
+    self:DrawPageScrollbar(cx, viewportTop, cw, viewportH)
 
     local resizeHit = 22
     self:Register("resize", wx + ww - resizeHit, wy + wh - resizeHit, resizeHit, resizeHit, function()
@@ -5465,44 +6204,85 @@ function Gui:Render()
 
     self:DrawOverlay(wx, wy, ww, wh)
     self:EndFrame()
-    self.dirty = false
+    self.dirty = needsFollowup
 end
 
-function Gui:HandleWheel(delta)
-    if not delta or delta == 0 then return end
-    local mx, my = Mouse.X, Mouse.Y
-    if self.overlay and self.overlayMetrics and inRect(mx, my, self.overlayMetrics.x, self.overlayMetrics.y, self.overlayMetrics.w, self.overlayMetrics.h) then
-        self.overlayScroll = clamp(self.overlayScroll - delta * 34, 0, self.overlayScrollMax or 0)
-        self.dirty = true
-        return
-    end
-    local m = self.resultMetrics
-    if m and inRect(mx, my, m.x, m.y, m.w, m.h) then
-        self:ScrollResults(-delta * 42)
-    end
+-- ================================================================
+-- SCROLL NO MODELO REAL DO INSui
+--
+-- O INSui original mantem State.mouseScroll, zera-o a cada ciclo e o
+-- consumidor transforma apenas o SINAL em um passo de 42 px para a pagina.
+-- Nao existe no arquivo INSui fornecido uma rotina que capture fisicamente a
+-- rodinha. Por isso esta camada NAO inventa InputChanged/WheelForward/etc.
+--
+-- FeedMouseScroll(delta) e o ponto unico de entrada. Ele fica exposto como
+-- __UTMM_GUIDER_MOUSE_SCROLL para uma eventual fonte de wheel do host/Matcha.
+-- A propria UI continua totalmente funcional por scrollbar, drag e teclado.
+-- ================================================================
+function Gui:FeedMouseScroll(delta)
+    delta = tonumber(delta) or 0
+    if delta == 0 then return false end
+    self.mouseScroll = delta > 0 and 1 or -1
+    self.dirty = true
+    return true
 end
 
--- Algumas builds do Matcha entregam MouseWheel por InputBegan; outras nao.
--- O scrollbar arrastavel permanece funcional mesmo quando o evento nao existe.
-if UserInputService and UserInputService.InputBegan then
+function Gui:ConsumeMouseScroll()
+    local delta = tonumber(self.mouseScroll) or 0
+    -- Mesmo ciclo do INSui: o pulso e consumido uma vez e volta a zero.
+    self.mouseScroll = 0
+    if delta == 0 then return false end
+
+    local sign = delta > 0 and 1 or -1
+    local mx, my = Mouse.X or 0, Mouse.Y or 0
+
+    -- Overlay tem prioridade, como dropdown/menus sobrepostos no INSui.
+    if self.overlay then
+        local m = self.overlayMetrics
+        if m and inRect(mx, my, m.x, m.y, m.w, m.h) then
+            local before = self.overlayScroll or 0
+            self.overlayScroll = clamp(before - sign * 34, 0, self.overlayScrollMax or 0)
+            if self.overlayScroll ~= before then self.dirty = true end
+            return true
+        end
+        return false
+    end
+
+    local m = self.pageMetrics
+    if not m or (self.pageScrollMax[self.selectedPage] or 0) <= 0 then return false end
+    if not inRect(mx, my, m.x, m.y, m.w + 22, m.h) then return false end
+
+    -- Valor literal do INSui: 42 px por pulso de wheel.
+    return self:ScrollResults(-sign * 42)
+end
+
+-- Ponte propositalmente simples. Se uma build futura do Matcha/host expuser
+-- wheel INPUT, basta chamar __UTMM_GUIDER_MOUSE_SCROLL(+1/-1). Nao usa
+-- mousescroll(), pois essa funcao INJETA uma rodinha no jogo; nao a le.
+local function installMouseScrollBridge()
+    local bridge = function(delta)
+        if Gui.running then Gui:FeedMouseScroll(delta) end
+    end
+    Gui.mouseScrollBridge = bridge
     pcall(function()
-        UserInputService.InputBegan:Connect(function(input)
-            local kind = ""
-            pcall(function() kind = tostring(input.UserInputType) end)
-            if string.find(kind, "MouseWheel", 1, true) then
-                local delta = 0
-                pcall(function() delta = input.Position.Z end)
-                if delta == 0 then pcall(function() delta = input.Delta.Z end) end
-                Gui:HandleWheel(delta)
-            end
-        end)
+        if type(_G) == "table" then _G.__UTMM_GUIDER_MOUSE_SCROLL = bridge end
+    end)
+    pcall(function()
+        if type(getgenv) == "function" then getgenv().__UTMM_GUIDER_MOUSE_SCROLL = bridge end
+    end)
+    pcall(function()
+        if type(shared) == "table" then shared.__UTMM_GUIDER_MOUSE_SCROLL = bridge end
     end)
 end
 
+installMouseScrollBridge()
+
 function Gui:PollFallbackScrollKeys()
     if self.activeInput then return end
+    local viewportH = (self.pageMetrics and self.pageMetrics.h) or 400
     local mappings = {
-        {VK.UP, -32}, {VK.DOWN, 32}, {VK.PGUP, -180}, {VK.PGDN, 180},
+        {VK.UP, -60}, {VK.DOWN, 60},
+        {VK.PGUP, -viewportH * 0.8}, {VK.PGDN, viewportH * 0.8},
     }
     for _, item in ipairs(mappings) do
         local code, amount = item[1], item[2]
@@ -5523,8 +6303,20 @@ end
 
 function Gui:HandleMouse(dt)
     local mx, my = Mouse.X or 0, Mouse.Y or 0
+    -- Atualiza a captura antes de ler o clique. Isso impede que o mesmo clique
+    -- usado em um botao/campo Drawing atravesse para o Roblox ao fundo.
+    self:UpdateRobloxInputCapture(false)
     local down = type(ismouse1pressed) == "function" and ismouse1pressed() or false
     local pressed = down and not self.lastMouseDown
+
+    if self.textDragging and self.activeInput and down then
+        local original = self.caret
+        self.caret = self:MouseToInputCaret(self.activeInput, mx)
+        if math.abs(mx - (self.textDragStartX or mx)) > 3 and self.selectionAnchor == nil then
+            self.selectionAnchor = original
+        end
+        self.dirty = true
+    end
 
     if self.draggingWindow and down then
         self.window.x = math.floor(mx - self.dragDX)
@@ -5545,12 +6337,22 @@ function Gui:HandleMouse(dt)
             self.window.maxHeight
         )
         self.dirty = true
-    elseif self.draggingResultScroll and down and self.resultMetrics then
-        local m = self.resultMetrics
+    elseif self.draggingPageScroll and down and self.pageMetrics and self.pageMetrics.thumbH then
+        local m = self.pageMetrics
         local travel = math.max(1, m.trackH - m.thumbH)
-        local thumbY = my - self.scrollGrab
+        local thumbY = my - self.pageScrollGrab
         local ratio = clamp((thumbY - m.trackY) / travel, 0, 1)
-        self.resultScroll[self.selectedPage] = ratio * (self.resultScrollMax[self.selectedPage] or 0)
+        self.pageTargetScroll[self.selectedPage] = ratio * (self.pageScrollMax[self.selectedPage] or 0)
+        self.pageVelocity[self.selectedPage] = 0
+        self.dirty = true
+    elseif self.pageContentDrag and down then
+        local d = self.pageContentDrag
+        local dtSafe = math.max(1 / 240, self.lastDt or (1 / 60))
+        local nextValue = clamp(d.start - (my - d.my), 0, self.pageScrollMax[d.page] or 0)
+        local oldTarget = self.pageTargetScroll[d.page] or d.start
+        local velocity = (nextValue - oldTarget) / dtSafe
+        self.pageVelocity[d.page] = (self.pageVelocity[d.page] or 0) * 0.72 + velocity * 0.28
+        self.pageTargetScroll[d.page] = nextValue
         self.dirty = true
     elseif self.draggingOverlayScroll and down and self.overlayMetrics then
         local m = self.overlayMetrics
@@ -5565,7 +6367,11 @@ function Gui:HandleMouse(dt)
         self.draggingWindow = false
         self.draggingResize = false
         self.draggingResultScroll = false
+        self.draggingPageScroll = false
+        self.pageContentDrag = nil
         self.draggingOverlayScroll = false
+        self.textDragging = false
+        if self.selectionAnchor == self.caret then self.selectionAnchor = nil end
     end
 
     local hit = self:Hit(mx, my)
@@ -5584,6 +6390,15 @@ function Gui:HandleMouse(dt)
         elseif self.overlay then
             self.overlay = nil
             self.dirty = true
+        elseif self.pageMetrics and (self.pageScrollMax[self.selectedPage] or 0) > 0
+            and inRect(mx, my, self.pageMetrics.x, self.pageMetrics.y, self.pageMetrics.w, self.pageMetrics.h) then
+            -- Arraste em area vazia do conteudo, com inercia ao soltar. Controles
+            -- continuam tendo prioridade porque os hitboxes sao processados antes.
+            self.pageContentDrag = {
+                page = self.selectedPage, my = my,
+                start = self.pageTargetScroll[self.selectedPage] or self.pageScroll[self.selectedPage] or 0,
+            }
+            self.pageVelocity[self.selectedPage] = 0
         end
     end
 
@@ -5593,8 +6408,36 @@ end
 
 function Gui:Shutdown()
     if not self.running then return end
+    self:BlurInput(false)
+    self:SetRobloxInputBlocked(false, true)
+    state.requestId = state.requestId + 1
+    state.activeRequestId = nil
+    state.busy = false
+    pendingJob = nil
+    self.draggingPageScroll = false
+    self.pageContentDrag = nil
     self.running = false
     self.visible = false
+    pcall(function()
+        if type(_G) == "table" and _G.__UTMM_GUIDER_MOUSE_SCROLL == self.mouseScrollBridge then
+            _G.__UTMM_GUIDER_MOUSE_SCROLL = nil
+        end
+    end)
+    pcall(function()
+        if type(getgenv) == "function" and getgenv().__UTMM_GUIDER_MOUSE_SCROLL == self.mouseScrollBridge then
+            getgenv().__UTMM_GUIDER_MOUSE_SCROLL = nil
+        end
+    end)
+    pcall(function()
+        if type(shared) == "table" and shared.__UTMM_GUIDER_MOUSE_SCROLL == self.mouseScrollBridge then
+            shared.__UTMM_GUIDER_MOUSE_SCROLL = nil
+        end
+    end)
+    self.mouseScrollBridge = nil
+    if renderConnection then
+        pcall(function() renderConnection:Disconnect() end)
+        renderConnection = nil
+    end
     for _, list in pairs(self.pool) do
         for _, obj in ipairs(list) do
             pcall(function() obj:Remove() end)
@@ -5606,7 +6449,17 @@ function Gui:Shutdown()
         pcall(function() self.logoObject:Remove() end)
         self.logoObject = nil
     end
+    pcall(function()
+        if type(_G) == "table" and _G.__UTMM_GUIDER_SHUTDOWN == state.shutdownHandle then
+            _G.__UTMM_GUIDER_SHUTDOWN = nil
+        end
+    end)
 end
+
+state.shutdownHandle = function() Gui:Shutdown() end
+pcall(function()
+    if type(_G) == "table" then _G.__UTMM_GUIDER_SHUTDOWN = state.shutdownHandle end
+end)
 
 Gui:LoadLogo()
 syncLanguage(comboDefault("utmm_lang"))
@@ -5615,32 +6468,54 @@ spawn(function()
     while Gui.running do
         local job = pendingJob
         if job then
-            local page = pendingJobPage or Gui.selectedPage
             pendingJob = nil
-            pendingJobPage = nil
+            state.activeRequestId = job.id
             notify(Lang.Searching, "UTMM Guider", 1)
-            local ok, err = pcall(job)
-            if not ok then
+            local ok, err = pcall(job.fn)
+            local current = (job.id == state.requestId)
+            state.activeRequestId = nil
+
+            local cancelled = (not ok) and string.find(tostring(err), state.cancelToken, 1, true) ~= nil
+            if not ok and not cancelled then
                 state.busy = false
-                Gui.pageBusy[page] = false
+                if Gui.pageRequestId[job.page] == job.id then Gui.pageBusy[job.page] = false end
                 warn("[UTMM Guider] " .. tostring(err))
             end
-            Gui:CapturePage(page)
-            notify(tostring(state.count) .. " " .. ((state.countKind == "best") and Lang.Best or Lang.Found), "UTMM Guider", 2)
+
+            -- Somente a geracao mais recente pode publicar/capturar estado.
+            if ok and current then
+                Gui:CapturePage(job.page)
+                notify(tostring(state.count) .. " " .. ((state.countKind == "best") and Lang.Best or Lang.Found), "UTMM Guider", 2)
+            elseif Gui.pageRequestId[job.page] == job.id then
+                Gui.pageBusy[job.page] = false
+                Gui.dirty = true
+            end
         end
         wait(0.04)
     end
 end)
 
-local renderConnection
+-- Captura de input no mesmo principio do INSui: polling unico para teclado e
+-- setrobloxinput(false) enquanto houver foco ou interacao sobre a janela.
+spawn(function()
+    while Gui.running do
+        Gui:UpdateRobloxInputCapture(false)
+        if Gui.activeInput then
+            Gui:PollTextInput()
+        end
+        task.wait(0.004)
+    end
+end)
+
 renderConnection = RunService.RenderStepped:Connect(function(dt)
     if not Gui.running then
         if renderConnection then pcall(function() renderConnection:Disconnect() end) end
         return
     end
 
-    Gui:PollTextInput()
     Gui:PollFallbackScrollKeys()
+    Gui:ConsumeMouseScroll()
+    Gui:StepPageScroll(dt)
     Gui:HandleMouse(dt)
 
     if state.stamp ~= Gui.lastStamp then
